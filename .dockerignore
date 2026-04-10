@@ -1,0 +1,15 @@
+.git
+.github
+.DS_Store
+.env
+.env.*
+bin/
+artifacts/
+coverage/
+dist/
+node_modules/
+web/dashboard/dist/
+web/dashboard/node_modules/
+*.log
+*.tmp
+*.local

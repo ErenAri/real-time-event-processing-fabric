@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+bin/
+dist/
+node_modules/
+coverage/
+*.log
+*.tmp
+*.local
+data/raw-archive/
+artifacts/

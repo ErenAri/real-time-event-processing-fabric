@@ -1,0 +1,38 @@
+groups:
+  - name: pulsestream
+    rules:
+      - alert: AllStreamProcessorsDown
+        expr: sum(up{job="stream-processor"}) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: All stream processor replicas are down
+          description: Prometheus cannot scrape any active stream processor replica.
+
+      - alert: StreamProcessorReplicaDown
+        expr: count(up{job="stream-processor"} == 0) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: A stream processor replica is down
+          description: At least one stream processor replica has stopped responding while others may still be healthy.
+
+      - alert: ConsumerLagHigh
+        expr: sum(pulsestream_processor_consumer_lag) > 500
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kafka consumer lag is elevated
+          description: Aggregated consumer lag has remained above 500 messages for more than 2 minutes.
+
+      - alert: RejectionsBurst
+        expr: sum(rate(pulsestream_ingest_rejected_total[5m])) > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ingest rejection burst detected
+          description: Rejected event rate is above 5 events per second over the last 5 minutes.

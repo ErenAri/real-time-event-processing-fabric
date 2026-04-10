@@ -1,0 +1,202 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: pulsestream
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pulsestream"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  kafka:
+    image: apache/kafka:4.0.2
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  ingest-service:
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile.go-service
+      args:
+        SERVICE_PATH: services/ingest-service
+    environment:
+      POSTGRES_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: pulsestream.events
+      KAFKA_BATCH_TIMEOUT: 5ms
+      KAFKA_BATCH_SIZE: 256
+      INGEST_LISTEN_ADDR: :8080
+      RAW_ARCHIVE_DIR: /var/lib/pulsestream/archive
+      ADMIN_TOKEN: pulsestream-dev-admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    expose:
+      - "8080"
+    volumes:
+      - archive-data:/var/lib/pulsestream/archive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  stream-processor:
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile.go-service
+      args:
+        SERVICE_PATH: services/stream-processor
+    environment:
+      POSTGRES_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: pulsestream.events
+      KAFKA_GROUP_ID: pulsestream-processor
+      PROCESSOR_LISTEN_ADDR: :8082
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      ingest-service:
+        condition: service_started
+    expose:
+      - "8082"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  query-service:
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile.go-service
+      args:
+        SERVICE_PATH: services/query-service
+    environment:
+      POSTGRES_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
+      QUERY_LISTEN_ADDR: :8081
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  producer-simulator:
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile.go-service
+      args:
+        SERVICE_PATH: services/producer-simulator
+    environment:
+      SIM_INGEST_ENDPOINT: http://ingest-service:8080/api/v1/events
+      SIMULATOR_LISTEN_ADDR: :8083
+      SIM_RATE_PER_SEC: 1000
+      SIM_TENANT_COUNT: 5
+      SIM_SOURCES_PER_TENANT: 25
+      SIM_DUPLICATE_EVERY: 250
+      SIM_MALFORMED_EVERY: 500
+      SIM_BURST_EVERY: 30s
+      SIM_BURST_SIZE: 200
+    depends_on:
+      ingest-service:
+        condition: service_started
+    ports:
+      - "8083:8083"
+    expose:
+      - "8083"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile.dashboard
+    depends_on:
+      query-service:
+        condition: service_started
+    ports:
+      - "4173:80"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    user: "0:0"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      ingest-service:
+        condition: service_started
+      stream-processor:
+        condition: service_started
+      query-service:
+        condition: service_started
+      producer-simulator:
+        condition: service_started
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+    ports:
+      - "3000:3000"
+
+volumes:
+  archive-data:
+  postgres-data:
+  grafana-data:
