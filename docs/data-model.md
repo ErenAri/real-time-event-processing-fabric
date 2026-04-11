@@ -17,26 +17,81 @@
 }
 ```
 
-## Event invariants
+## Event constraints
 
-- `schema_version` is required and currently fixed at `1`
-- `event_id` must be unique across the stream
-- `tenant_id` and `source_id` are required
-- `timestamp` must be UTC and parseable as RFC3339
-- `status` must be one of `ok`, `warn`, or `error`
-- `value` is numeric so aggregation and thresholding remain straightforward
+| Field | Constraint |
+| --- | --- |
+| `schema_version` | required, currently fixed at `1` |
+| `event_id` | required, unique across the processed stream |
+| `tenant_id` | required |
+| `source_id` | required |
+| `timestamp` | UTC RFC3339 timestamp |
+| `status` | one of `ok`, `warn`, `error` |
+| `value` | numeric |
 
-The formal JSON Schema for this contract lives at [schemas/telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json).
+The formal JSON Schema is in [schemas/telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json).
 
-## PostgreSQL tables
+## Storage model
 
-### `processed_events`
+```mermaid
+erDiagram
+    processed_events {
+        text event_id PK
+        text tenant_id
+        timestamptz processed_at
+    }
 
-Tracks the deduplication key. If an `event_id` already exists, the processor treats the message as a duplicate and skips aggregate updates.
+    tenant_metrics {
+        timestamptz bucket_start PK
+        text tenant_id PK
+        bigint events_count
+        bigint ok_count
+        bigint warn_count
+        bigint error_count
+        double value_sum
+        timestamptz last_event_at
+    }
+
+    source_metrics {
+        text tenant_id PK
+        text source_id PK
+        bigint events_count
+        timestamptz last_event_at
+    }
+
+    rejection_events {
+        bigint id PK
+        text reason
+        text tenant_id
+        text source_id
+        jsonb payload
+        timestamptz created_at
+    }
+
+    service_state {
+        text service_name PK
+        text instance_id PK
+        jsonb payload
+        timestamptz updated_at
+    }
+
+    processed_events ||--o{ tenant_metrics : contributes_to
+    processed_events ||--o{ source_metrics : contributes_to
+```
+
+## Table semantics
+
+| Table | Purpose |
+| --- | --- |
+| `processed_events` | Deduplication guard keyed by `event_id` |
+| `tenant_metrics` | 10-second aggregate buckets used for throughput and status charts |
+| `source_metrics` | Per-tenant cumulative source counters used for top-source queries |
+| `rejection_events` | Records ingest validation failures and publish failures |
+| `service_state` | Stores per-instance heartbeats and counters for ingest, processor, and query services |
 
 ## Raw archive
 
-Accepted events are also written to an immutable NDJSON archive partitioned by UTC day:
+Accepted events are written to an immutable NDJSON archive partitioned by UTC day.
 
 ```text
 RAW_ARCHIVE_DIR/
@@ -46,38 +101,16 @@ RAW_ARCHIVE_DIR/
         events.ndjson
 ```
 
-Each line stores:
+Each line contains:
 
 - `archived_at`
 - the decoded `event`
 - the original `raw_payload`
 
-This gives the system a replayable cold path before cloud object storage is introduced.
+The raw archive provides the cold path for replay and hot-view rebuilds.
 
-### `tenant_metrics`
+## Service state semantics
 
-Stores 10-second aggregate buckets:
+The `service_state` table uses `service_name + instance_id` as its key. This allows multiple processor replicas to report independently without overwriting each other.
 
-- total events
-- `ok`, `warn`, and `error` counts
-- summed values for average calculations
-- last event timestamp
-
-### `source_metrics`
-
-Stores cumulative per-tenant source counters for top-N dashboards.
-
-### `rejection_events`
-
-Stores malformed payloads, validation failures, and publish failures from the ingest service.
-
-### `service_state`
-
-Stores periodic snapshots from ingest, processor, and query processes so the query API can surface heartbeats and cumulative counters without scraping Prometheus directly.
-
-Current key shape:
-
-- `service_name`
-- `instance_id`
-
-The query layer ignores stale snapshot rows so restarted or removed replicas do not continue to count as active capacity.
+The query layer ignores stale rows so that stopped or replaced replicas do not continue to count as live capacity.

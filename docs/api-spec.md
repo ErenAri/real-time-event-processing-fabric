@@ -1,10 +1,38 @@
-# API Spec
+# API Specification
 
-## Event ingest
+## Endpoint summary
+
+| Service | Method | Path | Auth | Purpose |
+| --- | --- | --- | --- | --- |
+| `ingest-service` | `POST` | `/api/v1/events` | none in local Compose | Accept one telemetry event |
+| `ingest-service` | `POST` | `/api/v1/admin/replay` | admin token | Replay archived events back into Kafka |
+| `query-service` | `GET` | `/api/v1/metrics/overview` | none in local Compose | Return platform-wide overview metrics |
+| `query-service` | `GET` | `/api/v1/metrics/tenants/{tenantId}` | none in local Compose | Return tenant bucket series |
+| `query-service` | `GET` | `/api/v1/metrics/sources/top` | none in local Compose | Return top sources, optionally filtered by tenant |
+| `query-service` | `GET` | `/api/v1/metrics/rejections` | none in local Compose | Return latest ingest rejections |
+| every Go service | `GET` | `/healthz` | none | Liveness probe |
+| every Go service | `GET` | `/readyz` | none | Readiness probe |
+| every Go service | `GET` | `/metrics` | none | Prometheus metrics |
+
+## Common conventions
+
+- Payloads are JSON.
+- Timestamps are UTC RFC3339 values.
+- Error responses use the form:
+
+```json
+{
+  "error": "message"
+}
+```
+
+- The local Compose deployment is intentionally open except for the replay endpoint.
+
+## Ingest event
 
 ### `POST /api/v1/events`
 
-Accepts a single telemetry event.
+Accepts one telemetry event and returns `202 Accepted` when the event is validated, archived, and published to Kafka.
 
 Request body:
 
@@ -23,7 +51,7 @@ Request body:
 }
 ```
 
-Response `202 Accepted`:
+Successful response:
 
 ```json
 {
@@ -33,7 +61,7 @@ Response `202 Accepted`:
 }
 ```
 
-Response `400 Bad Request`:
+Typical rejection:
 
 ```json
 {
@@ -41,29 +69,81 @@ Response `400 Bad Request`:
 }
 ```
 
-## Query service
+## Overview query
 
 ### `GET /api/v1/metrics/overview`
 
-Returns platform-wide throughput, lag, latency, and recent rejection information.
+Returns platform-wide state aggregated from PostgreSQL hot views and recent service snapshots.
+
+Representative response shape:
+
+```json
+{
+  "generated_at": "2026-04-10T18:29:14Z",
+  "accepted_total": 251154,
+  "rejected_total": 343,
+  "processed_total": 1910754,
+  "duplicate_total": 10385,
+  "consumer_lag": 0,
+  "processor_instances": 3,
+  "processor_active_partitions": 3,
+  "processor_inflight_messages": 402,
+  "events_per_second_last_minute": 558.11,
+  "error_rate_last_minute": 0.2447,
+  "processing_p50_ms": 2,
+  "processing_p95_ms": 6,
+  "processing_p99_ms": 11,
+  "recent_rejections": []
+}
+```
+
+## Tenant series
 
 ### `GET /api/v1/metrics/tenants/{tenantId}?window=15m`
 
-Returns 10-second buckets for the requested tenant.
+Returns 10-second tenant buckets for the requested time window.
+
+Response shape:
+
+```json
+{
+  "tenant_id": "tenant_01",
+  "window": "15m0s",
+  "series": [
+    {
+      "bucket_start": "2026-04-10T18:20:00Z",
+      "events_count": 245,
+      "ok_count": 180,
+      "warn_count": 32,
+      "error_count": 33,
+      "average_value": 72.9
+    }
+  ]
+}
+```
+
+## Top sources
 
 ### `GET /api/v1/metrics/sources/top?tenantId=tenant_01&limit=8`
 
-Returns the most active sources, optionally filtered to a single tenant.
+Returns the most active sources ordered by cumulative event count.
+
+## Recent rejections
 
 ### `GET /api/v1/metrics/rejections?limit=10`
 
-Returns the newest ingest rejections captured in PostgreSQL.
+Returns the newest rejection rows recorded by the ingest service.
 
-## Admin replay
+## Replay
 
 ### `POST /api/v1/admin/replay`
 
-Local admin endpoint on the ingest service. Requires `X-Admin-Token` or `Authorization: Bearer <token>`.
+This endpoint republishes archived events from the raw archive back into Kafka. It is intended for local operator use only.
+
+Auth headers:
+
+- `X-Admin-Token: pulsestream-dev-admin`
+- or `Authorization: Bearer pulsestream-dev-admin`
 
 Request body:
 
@@ -76,7 +156,7 @@ Request body:
 }
 ```
 
-Response `200 OK`:
+Successful response:
 
 ```json
 {
@@ -94,16 +174,6 @@ Response `200 OK`:
 }
 ```
 
-## Service health and metrics
+## Authentication scope
 
-Each Go service exposes:
-
-- `GET /healthz`
-- `GET /readyz`
-- `GET /metrics`
-
-## Auth
-
-The MVP is intentionally unauthenticated inside the local Compose environment. JWT auth and tenant-scoped authorization are reserved for the next gate after throughput and failure evidence are stable.
-
-The replay endpoint is the one exception: it uses a local shared admin token so replay is not anonymously exposed in the dev environment.
+The local Compose environment is intentionally unauthenticated for the ingest and query endpoints so benchmarking and failure drills remain straightforward. Tenant authentication and authorization are not implemented yet. The replay endpoint is the only local endpoint that is protected.

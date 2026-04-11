@@ -1,55 +1,158 @@
 # Architecture
 
-## Objective
+## Scope
 
-PulseStream demonstrates a focused streaming architecture: high-volume event ingress, near-real-time aggregation, hot operational reads, and observable failure behavior. The MVP is intentionally narrow so the benchmark and recovery evidence stays credible.
+PulseStream is a local-first event analytics platform that emphasizes distributed-systems concerns over product breadth. The current implementation focuses on ingestion, streaming aggregation, replay, observability, and measurable failure behavior.
 
-## Components
+## System diagram
 
-- `producer-simulator`: emits synthetic telemetry at configurable rates, including duplicates, malformed payloads, and burst traffic
-- `ingest-service`: validates event payloads, records rejections, publishes accepted events to Kafka, and emits ingest metrics
-- `raw archive`: immutable NDJSON event log written by ingest-service before broker publish, used for replay and backfills
-- `stream-processor`: consumes Kafka partitions, processes partitions in parallel while preserving per-partition ordering, deduplicates by `event_id`, computes hot aggregates, and stores per-instance service state snapshots
-- `query-service`: exposes low-latency operational APIs for dashboard reads
-- `PostgreSQL`: hot store for aggregate buckets, source counters, rejection history, and service state
-- `Kafka`: durable broker between write and processing paths
-- `dashboard`: React UI for throughput, lag, latency, and rejection visibility
-- `Prometheus` and `Grafana`: metrics collection and local operational visibility
+```mermaid
+flowchart LR
+    subgraph Load
+        PS[producer-simulator]
+    end
 
-## Data flow
+    subgraph Write path
+        IS[ingest-service]
+        RA[(raw archive)]
+        K[(Kafka)]
+    end
 
-### Write path
+    subgraph Processing
+        SP1[processor replica 1]
+        SP2[processor replica 2]
+        SPN[processor replica N]
+    end
 
-`producer-simulator -> ingest-service -> raw archive + Kafka -> stream-processor -> PostgreSQL`
+    subgraph State
+        DB[(PostgreSQL)]
+    end
 
-### Read path
+    subgraph Read path
+        QS[query-service]
+        UI[dashboard]
+    end
 
-`dashboard -> query-service -> PostgreSQL`
+    subgraph Telemetry
+        PM[Prometheus]
+        GF[Grafana]
+    end
 
-## Design decisions
+    PS --> IS
+    IS --> RA
+    IS --> K
+    K --> SP1
+    K --> SP2
+    K --> SPN
+    SP1 --> DB
+    SP2 --> DB
+    SPN --> DB
+    QS --> DB
+    UI --> QS
+    PS --> PM
+    IS --> PM
+    SP1 --> PM
+    SP2 --> PM
+    SPN --> PM
+    QS --> PM
+    PM --> GF
+```
 
-- Kafka over a cloud-managed broker first: stronger local reproducibility and better control over failure testing
-- PostgreSQL as the only hot store in MVP: simpler than Redis plus Postgres while still supporting aggregate reads cleanly
-- Idempotent at-least-once processing: `processed_events.event_id` acts as the duplicate guard without the complexity of exactly-once semantics
-- Partition-parallel processing in one processor instance: keeps ordering within a partition but allows different Kafka partitions to make progress concurrently
-- Instance-aware processor state aggregation: each processor replica writes its own heartbeat row and the query layer aggregates live replicas instead of assuming a single process
-- Immutable raw archive before broker publish: keeps a replayable event history even if downstream processing needs to be rebuilt
-- Docker Compose before Kubernetes: faster iteration and easier benchmark reproducibility on a single developer machine
+## Write path
 
-## Hot views
+```mermaid
+sequenceDiagram
+    participant Producer as producer-simulator
+    participant Ingest as ingest-service
+    participant Archive as raw archive
+    participant Kafka as Kafka
+    participant Processor as stream-processor
+    participant Postgres as PostgreSQL
 
-- `tenant_metrics`: 10-second time buckets used for rolling throughput and status charts
-- `source_metrics`: cumulative source activity for top-N reads
-- `rejection_events`: recent ingest failures for operator visibility
-- `service_state`: lightweight snapshots keyed by `service_name + instance_id`, with stale rows ignored by the query layer so dead replicas do not inflate live totals
+    Producer->>Ingest: POST /api/v1/events
+    Ingest->>Ingest: validate schema and required fields
+    Ingest->>Archive: append NDJSON record
+    Ingest->>Kafka: publish accepted event
+    Kafka-->>Processor: deliver message
+    Processor->>Processor: decode and deduplicate
+    Processor->>Postgres: upsert hot aggregates and service state
+```
 
-## Observability
+## Read path
 
-- Prometheus metrics from every Go service and the simulator, discovered from Docker so scaled processor replicas are scraped automatically
-- JSON structured logs with request timing and failure reasons
-- OpenTelemetry HTTP instrumentation is wired in, with trace export disabled by default for local throughput runs and `stdout` export available when explicitly enabled
-- Alerting rules for processor outage, elevated lag, and rejection bursts
+```mermaid
+sequenceDiagram
+    participant UI as dashboard
+    participant Query as query-service
+    participant Postgres as PostgreSQL
+
+    UI->>Query: GET /api/v1/metrics/overview
+    Query->>Postgres: read overview and service state
+    Postgres-->>Query: aggregates and recent rejections
+    Query-->>UI: overview payload
+```
 
 ## Replay path
 
-`admin client -> ingest-service replay endpoint -> raw archive scan -> Kafka -> stream-processor -> PostgreSQL`
+```mermaid
+sequenceDiagram
+    participant Admin as operator
+    participant Ingest as ingest-service
+    participant Archive as raw archive
+    participant Kafka as Kafka
+    participant Processor as stream-processor
+    participant Postgres as PostgreSQL
+
+    Admin->>Ingest: POST /api/v1/admin/replay
+    Ingest->>Archive: scan archived NDJSON files
+    Ingest->>Kafka: republish matching events
+    Kafka-->>Processor: replayed messages
+    Processor->>Postgres: reapply aggregates, skip duplicates
+```
+
+## Processor scaling model
+
+```mermaid
+flowchart TB
+    K[(Kafka topic partitions)]
+    P1[stream-processor-1]
+    P2[stream-processor-2]
+    P3[stream-processor-3]
+    SS[(service_state)]
+    Q[query-service]
+
+    K --> P1
+    K --> P2
+    K --> P3
+    P1 --> SS
+    P2 --> SS
+    P3 --> SS
+    SS --> Q
+```
+
+Each processor replica writes an instance-scoped heartbeat and metric snapshot into `service_state`. The query layer only reads recent snapshots, so stopped or replaced replicas do not continue to count as active capacity.
+
+## Design decisions
+
+| Decision | Current choice | Reason |
+| --- | --- | --- |
+| Broker | Kafka | Strong local reproducibility and direct visibility into partitions, offsets, and consumer groups |
+| Hot store | PostgreSQL | One operational store is simpler than a Redis plus PostgreSQL split at this stage |
+| Delivery semantics | Idempotent at-least-once | Easier to implement and explain than exactly-once while still demonstrating correctness controls |
+| Cold path | Local NDJSON archive | Supports replay and rebuild without requiring cloud object storage |
+| Local deployment | Docker Compose | Faster iteration and lower operational overhead than Kubernetes for the current stage |
+| Replica observability | Prometheus Docker service discovery | Allows local processor scaling evidence without static scrape targets |
+
+## Data owned by PostgreSQL
+
+- `tenant_metrics`: 10-second aggregate buckets for tenant charts
+- `source_metrics`: cumulative source counts for top-N queries
+- `processed_events`: deduplication keys
+- `rejection_events`: ingest-side validation and publish failures
+- `service_state`: per-instance snapshots for ingest, query, and processor services
+
+## Operational notes
+
+- Request tracing is wired in through OpenTelemetry, but trace export is disabled by default for throughput runs.
+- Prometheus scrapes services directly from Docker discovery metadata rather than static target lists.
+- Grafana is provisioned only as a local visualization layer. The query API remains the system-of-record read surface for the dashboard.
