@@ -1,82 +1,102 @@
 # Benchmarking
 
-## Goal
+## Purpose
 
-The MVP benchmark gate is `5k events/sec` sustained with live dashboard freshness under 2 seconds and no correctness regression in duplicate handling.
+The benchmark harness is used to measure throughput, lag, and query latency under a controlled synthetic load profile. The current goal is not headline throughput. The goal is defensible evidence for how the system behaves under load and how that behavior changes after engineering changes.
 
-## Local benchmark procedure
+## Benchmark harness
 
-1. Start the Compose stack:
+```mermaid
+flowchart LR
+    B[benchmark.ps1]
+    S[scale stream-processor replicas]
+    P[one-off producer container]
+    I[ingest-service]
+    K[Kafka]
+    SP[processor replicas]
+    Q[query-service overview]
+    M[Prometheus instant queries]
+    A[(JSON artifact)]
+
+    B --> S
+    B --> P
+    P --> I
+    I --> K
+    K --> SP
+    B --> Q
+    B --> M
+    Q --> A
+    M --> A
+```
+
+## Environment
+
+The most recent local artifacts were captured on:
+
+- OS: `Microsoft Windows 11 Pro`
+- CPU: `6` logical CPUs
+- Memory: `15.94 GiB`
+- Deployment: Docker Desktop with Docker Compose
+
+## Procedure
+
+1. Start the local stack.
 
    ```powershell
    docker compose -f deploy/docker-compose/docker-compose.yml up --build
    ```
 
-2. Run the benchmark driver:
+2. Run a benchmark.
 
    ```powershell
-   ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 60 -ProcessorReplicas 3
+   ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
    ```
 
-3. The benchmark driver now defaults to `-ProducerMode compose`, which runs a one-off `producer-simulator` inside the Docker network for a more representative producer path than a Windows host process.
+3. Review the generated JSON artifact under `artifacts/benchmarks/`.
 
-4. The benchmark driver now:
+The harness:
 
-   - stops the steady-state compose `producer-simulator` so the run is isolated
-   - optionally scales `stream-processor` to the requested replica count before the run
-   - starts a one-off benchmark producer container with explicit load-profile overrides
-   - samples `GET /api/v1/metrics/overview` through the full run
-   - sources throughput counters from Prometheus instant queries so multi-replica processor totals remain correct
-   - emits a JSON report under `artifacts/benchmarks/`
+- stops the steady-state simulator so the run is isolated
+- optionally scales `stream-processor` before the run
+- waits for the exact processor replica count to appear in Prometheus
+- runs a one-off producer container inside the Docker network
+- samples `GET /api/v1/metrics/overview`
+- reads ingest and processor counters through Prometheus instant queries
 
-5. Capture evidence from:
+## Metrics captured
 
-   - `GET /api/v1/metrics/overview`
-   - Prometheus queries for ingest and processor counters
-   - dashboard screenshots showing lag and rejection trends
-
-## Metrics to record
-
-- accepted events per second
-- processed events per second
-- consumer lag
-- processing latency p50, p95, p99
-- rejection rate
-- duplicate discard count
-- observed processor replica count
-- summed active partitions and in-flight backlog across processor replicas
+| Metric | Meaning |
+| --- | --- |
+| `producer_sent_eps` | events attempted by the benchmark producer |
+| `accepted_eps` | events accepted by the ingest service |
+| `processed_eps` | events written into hot views by the processor |
+| `peak_consumer_lag` | highest aggregated lag observed during the run |
+| `peak_processing_p50_ms`, `p95`, `p99` | processor latency window maxima observed during the run |
+| `query_latency_p50_ms`, `p95`, `p99` | latency of the overview API as measured by the harness |
+| `processor_replicas_observed` | exact replica count confirmed through Prometheus |
 
 ## Evidence table
 
-Fill this table after each benchmark run.
-
 | Date | Rate target | Duration | Accepted eps | Processed eps | P95 ms | P99 ms | Lag peak | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-04-10 | 1500 | 14s | 1209.48 | 330.52 | 18 | 28 | 52656 | compose producer baseline before processor optimization, artifact `artifacts/benchmarks/benchmark-20260410-191942.json` |
-| 2026-04-10 | 1500 | 14s | 1219.12 | 875.72 | 21 | 38 | 198421 | compose producer after partition-parallel processor workers and single-statement hot-store write, artifact `artifacts/benchmarks/benchmark-20260410-194727.json` |
-| 2026-04-10 | 1500 | 33s | 713.09 | 568.43 | 14 | 23 | 1308 | compose producer, exact-count harness, `1` processor replica, artifact `artifacts/benchmarks/benchmark-20260410-212955.json` |
-| 2026-04-10 | 1500 | 33s | 700.37 | 595.02 | 11 | 19 | 1246 | compose producer, exact-count harness, `3` processor replicas, artifact `artifacts/benchmarks/benchmark-20260410-213110.json` |
+| 2026-04-10 | 1500 | 14s | 1209.48 | 330.52 | 18 | 28 | 52656 | pre-optimization baseline, artifact `artifacts/benchmarks/benchmark-20260410-191942.json` |
+| 2026-04-10 | 1500 | 14s | 1219.12 | 875.72 | 21 | 38 | 198421 | partition-parallel processor and single-statement hot-store write, artifact `artifacts/benchmarks/benchmark-20260410-194727.json` |
+| 2026-04-10 | 1500 | 33s | 713.09 | 568.43 | 14 | 23 | 1308 | exact-count harness, `1` processor replica, artifact `artifacts/benchmarks/benchmark-20260410-212955.json` |
+| 2026-04-10 | 1500 | 33s | 700.37 | 595.02 | 11 | 19 | 1246 | exact-count harness, `3` processor replicas, artifact `artifacts/benchmarks/benchmark-20260410-213110.json` |
 
-## Current readout
+## Interpretation
 
-- The benchmark harness is now producing credible artifacts for the current local stack.
-- The ingest path is sustaining roughly `1.2k accepted eps` under the captured Compose-network benchmark profile.
-- Processor throughput improved from roughly `331 processed eps` to roughly `876 processed eps` after introducing partition-parallel workers and collapsing the Postgres write path into one atomic statement.
-- The stream processor is still the current bottleneck: even after the optimization pass, consumer lag continued to grow under the `1500 eps` target load.
-- The scale-aware benchmark harness now compares `1` vs `3` processor replicas under the same script behavior. In the latest pair of runs, `3` replicas improved processed throughput from `568.43 eps` to `595.02 eps`, while also improving `p95`/`p99` latency from `14/23 ms` to `11/19 ms`.
-- The latest pair also shows the current ceiling is no longer purely processor-side in this profile: the offered producer rate settled around `700-860 eps`, so the next benchmark pass should raise producer capacity or parallelism if the goal is to isolate processor scaling more aggressively.
-- On Windows, a host-native benchmark producer materially under-reported throughput compared with the Compose-network producer path, so `-ProducerMode compose` is the baseline method for published evidence.
+- The processor hot path improved substantially after the partition-parallel runner and the single-statement PostgreSQL write path were introduced.
+- The current scale-aware comparison shows a modest but real gain from `3` processor replicas relative to `1` replica under the same benchmark harness.
+- The latest pair should be read carefully: the producer path only sustained about `700-860 eps`, so processor scaling is no longer the only limiting factor in that profile.
+- Query latency remained low in all recent artifacts, which supports the claim that hot-view reads remain cheap under concurrent write load.
 
-## Next bottleneck
+## Current bottleneck
 
-The next performance gate is still processor throughput and lag recovery under sustained load. The next credible path is either increasing effective consumer parallelism further, reducing hot-store write cost again, or adding horizontal processor replicas with consumer-group evidence. Any claim above the current benchmark row should be backed by new artifacts after one of those changes.
+The next performance limitation is not solely the processor. The producer path now limits higher-rate local runs, which makes the scaling evidence directionally useful but not yet a hard upper bound for the processor group.
 
-## Scale-aware note
+The next defensible benchmark step is one of:
 
-The platform now supports scale-aware processor measurements:
-
-- `service_state` is aggregated by live `instance_id`
-- Prometheus discovers processor replicas from Docker rather than a single static target
-- benchmark artifacts record requested and observed processor replica counts
-
-Fresh multi-replica benchmark artifacts should be captured after the local Docker environment is stable again.
+- increase producer-side parallelism
+- run a stronger local load generator profile
+- capture the same benchmark in a cloud deployment where producer and broker capacity can be pushed further

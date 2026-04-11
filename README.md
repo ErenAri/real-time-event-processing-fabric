@@ -1,16 +1,97 @@
 # PulseStream
 
-PulseStream is a real-time event analytics platform built to demonstrate streaming-system fundamentals instead of CRUD breadth. The MVP ingests synthetic telemetry events through a Go HTTP service, publishes them to Kafka, processes them in near real time, stores hot views in PostgreSQL, and exposes a live React dashboard plus Prometheus-ready operational metrics.
+PulseStream is a real-time event analytics platform for synthetic telemetry. It ingests events through a Go HTTP service, publishes them to Kafka, processes them in near real time, stores hot operational views in PostgreSQL, archives raw payloads for replay, and exposes a React dashboard plus operator APIs.
 
-## MVP scope
+## What the project demonstrates
 
-- Go services for ingest, stream processing, query, and synthetic load generation
-- Kafka-backed event pipeline with idempotent-at-least-once processing
-- PostgreSQL hot views for tenant and source aggregates
-- Immutable raw-event archive plus admin replay for recovery and backfills
-- React + Vite live dashboard polling the query service every 2 seconds
-- Prometheus scraping, Grafana provisioning, and JSON structured service logs
-- Docker Compose topology and GitHub Actions CI
+- Event-driven architecture with a broker-backed write path
+- Idempotent at-least-once processing with duplicate suppression
+- Separation of hot operational state and cold raw event storage
+- Failure handling with replay and restart drills
+- Processor replica scaling with measured throughput and lag
+- Operational telemetry through Prometheus, Grafana, structured logs, and OpenTelemetry hooks
+
+## Architecture
+
+```mermaid
+flowchart LR
+    PS[producer-simulator]
+    IS[ingest-service]
+    RA[(raw archive)]
+    K[(Kafka topic)]
+    SP1[stream-processor replica 1]
+    SPN[stream-processor replica N]
+    DB[(PostgreSQL hot views)]
+    QS[query-service]
+    UI[React dashboard]
+    PM[Prometheus]
+    GF[Grafana]
+
+    PS -->|HTTP events| IS
+    IS -->|append raw payload| RA
+    IS -->|publish| K
+    K --> SP1
+    K --> SPN
+    SP1 -->|aggregate and deduplicate| DB
+    SPN -->|aggregate and deduplicate| DB
+    QS -->|read| DB
+    UI -->|poll| QS
+    IS --> PM
+    SP1 --> PM
+    SPN --> PM
+    QS --> PM
+    PS --> PM
+    PM --> GF
+```
+
+## Services
+
+| Component | Responsibility |
+| --- | --- |
+| `producer-simulator` | Generates synthetic telemetry, duplicates, malformed payloads, and burst traffic |
+| `ingest-service` | Validates events, records rejections, writes raw archive entries, and publishes to Kafka |
+| `stream-processor` | Consumes Kafka partitions, deduplicates by `event_id`, computes aggregates, and writes hot views |
+| `query-service` | Serves overview, tenant-series, top-source, and rejection APIs |
+| `dashboard` | Renders live operator views from the query API |
+| `Prometheus` and `Grafana` | Scrape and display platform metrics |
+
+## Current evidence
+
+| Scenario | Artifact | Summary |
+| --- | --- | --- |
+| Single processor benchmark | `artifacts/benchmarks/benchmark-20260410-212955.json` | `713.09 accepted eps`, `568.43 processed eps`, `p95 14 ms`, `lag peak 1308` |
+| Three processor benchmark | `artifacts/benchmarks/benchmark-20260410-213110.json` | `700.37 accepted eps`, `595.02 processed eps`, `p95 11 ms`, `lag peak 1246` |
+| Three replica restart drill | `artifacts/failure-drills/restart-processor-20260410-212812.json` | one processor replica restarted during load, `0` rejections, `p95 11 ms`, `lag peak 828` |
+
+Current local evidence shows that replica scaling improves processor-side throughput and tail latency, but the producer path is now limiting higher-rate local measurements. The next measurement gap is a higher-capacity producer profile or a cloud deployment variant that can stress the consumer group more aggressively.
+
+## Quick start
+
+1. Start the local stack.
+
+   ```powershell
+   docker compose -f deploy/docker-compose/docker-compose.yml up --build
+   ```
+
+2. Open the local surfaces.
+
+   - Dashboard: `http://localhost:4173`
+   - Query API: `http://localhost:8081/api/v1/metrics/overview`
+   - Ingest API: `http://localhost:8080/api/v1/events`
+   - Prometheus: `http://localhost:9090`
+   - Grafana: `http://localhost:3000`
+
+3. Run a benchmark.
+
+   ```powershell
+   ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+   ```
+
+4. Run a restart drill.
+
+   ```powershell
+   ./scripts/chaos/restart-processor.ps1 -Rate 1000 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+   ```
 
 ## Repository layout
 
@@ -22,6 +103,7 @@ services/
   query-service/
 internal/
   api/
+  archive/
   events/
   platform/
   processor/
@@ -29,96 +111,24 @@ internal/
   store/
   telemetry/
 web/dashboard/
-schemas/
 deploy/docker-compose/
 docs/
 scripts/
+schemas/
 ```
 
-## Quick start
+## Documentation
 
-1. Build and start the local stack:
+- [Architecture](docs/architecture.md)
+- [API specification](docs/api-spec.md)
+- [Data model](docs/data-model.md)
+- [Benchmarking](docs/benchmarking.md)
+- [Failure modes](docs/failure-modes.md)
+- [Runbook](docs/runbook.md)
 
-   ```powershell
-   docker compose -f deploy/docker-compose/docker-compose.yml up --build
-   ```
+## Current limits
 
-2. Open the live surfaces:
-
-   - Dashboard: `http://localhost:4173`
-   - Query API: `http://localhost:8081/api/v1/metrics/overview`
-   - Ingest API: `http://localhost:8080/api/v1/events`
-   - Prometheus: `http://localhost:9090`
-   - Grafana: `http://localhost:3000` with `admin` / `admin`
-
-3. Run the benchmark driver:
-
-   ```powershell
-   ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 60 -ProcessorReplicas 3
-   ```
-
-   The benchmark driver defaults to a one-off Compose-network producer so the published artifacts are not distorted by Windows host networking. It can also scale the processor service before a run and records the observed replica count in the artifact.
-
-## Current architecture
-
-```mermaid
-graph TD
-    subgraph Load Generation
-        PS[producer-simulator<br>Synthetic Telemetry]
-    end
-
-    subgraph Ingestion Layer
-        IS[ingest-service]
-        RA[(Raw Archive<br>NDJSON)]
-    end
-
-    subgraph Storage & Broker
-        K[Kafka<br>pulsestream.events]
-        DB[(PostgreSQL<br>Hot Views, State, Rejections)]
-    end
-
-    subgraph Processing Layer
-        SP[stream-processor<br>Idempotent, Partition-Parallel]
-    end
-
-    subgraph Serving Layer
-        QS[query-service]
-        UI[React Dashboard]
-    end
-
-    PS -->|HTTP POST| IS
-    IS -->|Cold Storage Write| RA
-    IS -->|Publish Event| K
-    
-    K -->|Consume| SP
-    SP -->|Aggregate / Upsert| DB
-    
-    UI -->|Polls every 2s| QS
-    QS -->|Query| DB
-```
-
-## Evidence goals
-
-- Throughput target: `5k events/sec` sustained for the MVP benchmark gate
-- Dashboard freshness target: under `2s`
-- Failure proofs: processor restart, duplicate handling, malformed burst handling, PostgreSQL slowdown drill
-- Docs and runbooks: see the files under [`docs/`](docs)
-
-## Status
-
-The codebase implements the MVP pipeline and local platform wiring. Tenant auth, replay jobs, Redis caching, and cloud deployment remain explicitly out of MVP and are called out as follow-on work in the docs.
-
-Current benchmark evidence shows the ingest path sustaining roughly `1.2k accepted eps` and the optimized processor sustaining roughly `876 processed eps` under the documented Compose benchmark profile. The repo now also has scale-aware evidence for processor replicas: under the current exact-count harness, a `3`-replica processor run processed `595.02 eps` versus `568.43 eps` for `1` replica, with better `p95`/`p99` latency and slightly lower peak lag. The next engineering gap is raising producer-side offered load so processor scaling can be measured under a harder sustained profile.
-
-## Admin replay
-
-The ingest service exposes a local admin replay endpoint guarded by `X-Admin-Token` or `Authorization: Bearer <token>`.
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://localhost:8080/api/v1/admin/replay `
-  -Headers @{ "X-Admin-Token" = "pulsestream-dev-admin" } `
-  -ContentType "application/json" `
-  -Body '{"start_date":"2026-04-10","tenant_id":"tenant_01","limit":500}'
-```
+- The local environment does not yet include tenant authentication or tenant-scoped authorization.
+- The hot path currently uses PostgreSQL only; Redis and cloud-native caches are not part of the current build.
+- The cloud deployment path and Event Hubs variant are not implemented yet.
+- The benchmark harness is credible for local evidence, but local producer throughput is currently the next limiting factor.
