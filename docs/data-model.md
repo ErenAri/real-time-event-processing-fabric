@@ -71,6 +71,19 @@ Stores cumulative per-tenant source counters for top-N dashboards.
 
 Stores malformed payloads, validation failures, and publish failures from the ingest service.
 
+### `pulsestream.events.dlq`
+
+Stores processor-side poison messages that were already present in Kafka but could not be decoded or validated by the consumer. Each record includes:
+
+- failure timestamp
+- failure reason
+- error string
+- source topic, partition, and offset
+- consumer group
+- optional event metadata when it could be recovered
+- base64-encoded original payload
+- base64-encoded Kafka headers
+
 ### `service_state`
 
 Stores periodic snapshots from ingest, processor, and query processes so the query API can surface heartbeats and cumulative counters without scraping Prometheus directly.
@@ -81,3 +94,12 @@ Current key shape:
 - `instance_id`
 
 The query layer ignores stale snapshot rows so restarted or removed replicas do not continue to count as active capacity.
+
+Processor snapshot payloads also carry:
+
+- `dead_letter_total`
+- `active_partitions`
+- `inflight_messages`
+- `processing_p50_ms`
+- `processing_p95_ms`
+- `processing_p99_ms`

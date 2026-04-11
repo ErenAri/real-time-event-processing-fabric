@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	eventarchive "pulsestream/internal/archive"
+	"pulsestream/internal/auth"
 	"pulsestream/internal/events"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
@@ -85,7 +86,7 @@ func TestIngestHandlerAcceptsValidEvent(t *testing.T) {
 	publisher := &fakePublisher{}
 	recorder := &fakeRejections{}
 	archiver := &fakeArchiver{}
-	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, archiver, nil, "", prometheus.NewRegistry())
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, archiver, nil, nil, "", prometheus.NewRegistry())
 
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(`{
 		"schema_version":1,
@@ -121,7 +122,7 @@ func TestIngestHandlerAcceptsValidEvent(t *testing.T) {
 func TestIngestHandlerRejectsMalformedPayload(t *testing.T) {
 	publisher := &fakePublisher{}
 	recorder := &fakeRejections{}
-	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, nil, nil, "", prometheus.NewRegistry())
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, nil, nil, nil, "", prometheus.NewRegistry())
 
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(`{"event_id":"broken"`))
 	rec := httptest.NewRecorder()
@@ -158,7 +159,7 @@ func TestIngestHandlerReplaysArchivedEventsForAuthorizedAdmin(t *testing.T) {
 			},
 		},
 	}
-	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, nil, replayer, "secret-admin", prometheus.NewRegistry())
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, nil, replayer, nil, "secret-admin", prometheus.NewRegistry())
 
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/replay", strings.NewReader(`{
 		"start_date":"2026-04-10",
@@ -178,5 +179,105 @@ func TestIngestHandlerReplaysArchivedEventsForAuthorizedAdmin(t *testing.T) {
 	}
 	if replayer.filter.TenantID != "tenant_1" {
 		t.Fatalf("expected tenant filter to be forwarded, got %q", replayer.filter.TenantID)
+	}
+}
+
+func TestIngestHandlerRejectsTenantMismatchForTenantToken(t *testing.T) {
+	verifier, err := auth.NewVerifier("secret-value", "pulsestream-local", "pulsestream-local")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	token, err := auth.SignHS256("secret-value", auth.NewClaims(
+		auth.RoleTenantUser,
+		"tenant_1",
+		"user-1",
+		"pulsestream-local",
+		"pulsestream-local",
+		time.Now().Add(time.Hour),
+	))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	publisher := &fakePublisher{}
+	recorder := &fakeRejections{}
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, nil, nil, verifier, "", prometheus.NewRegistry())
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(`{
+		"schema_version":1,
+		"event_id":"evt-1",
+		"tenant_id":"tenant_2",
+		"source_id":"sensor_1",
+		"event_type":"telemetry",
+		"timestamp":"2026-04-10T12:00:00Z",
+		"value":91.2,
+		"status":"ok",
+		"region":"eu-west",
+		"sequence":1
+	}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.handleEvents(rec, request)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+	if len(publisher.published) != 0 {
+		t.Fatalf("expected zero published events, got %d", len(publisher.published))
+	}
+}
+
+func TestIngestHandlerReplaysArchivedEventsForAdminJWT(t *testing.T) {
+	verifier, err := auth.NewVerifier("secret-value", "pulsestream-local", "pulsestream-local")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	token, err := auth.SignHS256("secret-value", auth.NewClaims(
+		auth.RoleAdmin,
+		"",
+		"admin-1",
+		"pulsestream-local",
+		"pulsestream-local",
+		time.Now().Add(time.Hour),
+	))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	publisher := &fakePublisher{}
+	replayer := &fakeReplayer{
+		events: []events.TelemetryEvent{
+			{
+				SchemaVersion: events.CurrentSchemaVersion,
+				EventID:       "evt-9",
+				TenantID:      "tenant_1",
+				SourceID:      "sensor_9",
+				EventType:     "telemetry",
+				Timestamp:     time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC),
+				Value:         22.5,
+				Status:        events.StatusOK,
+				Region:        "eu-west",
+				Sequence:      9,
+			},
+		},
+	}
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, nil, nil, replayer, verifier, "", prometheus.NewRegistry())
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/replay", strings.NewReader(`{
+		"start_date":"2026-04-10",
+		"tenant_id":"tenant_1",
+		"limit":10
+	}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.handleReplay(rec, request)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if len(publisher.published) != 1 {
+		t.Fatalf("expected one replayed publish, got %d", len(publisher.published))
 	}
 }

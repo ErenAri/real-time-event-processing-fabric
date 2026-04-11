@@ -79,7 +79,11 @@ func (a *FileArchive) Archive(ctx context.Context, event events.TelemetryEvent, 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if err := a.ensureWriterLocked(record.ArchivedAt); err != nil {
+	writerTimestamp := event.Timestamp.UTC()
+	if writerTimestamp.IsZero() {
+		writerTimestamp = record.ArchivedAt
+	}
+	if err := a.ensureWriterLocked(writerTimestamp); err != nil {
 		return err
 	}
 	if _, err := a.currentFile.Write(append(line, '\n')); err != nil {

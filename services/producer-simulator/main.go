@@ -77,12 +77,14 @@ func run() error {
 		return err
 	}
 	endpoint := platform.EnvString("SIM_INGEST_ENDPOINT", "http://localhost:8080/api/v1/events")
+	bearerToken := platform.EnvString("SIM_BEARER_TOKEN", "")
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 
 	generator := simulator.NewGenerator(simulator.Config{
 		Endpoint:         endpoint,
+		BearerToken:      bearerToken,
 		RatePerSecond:    ratePerSecond,
 		TenantCount:      tenantCount,
 		SourcesPerTenant: sourcesPerTenant,

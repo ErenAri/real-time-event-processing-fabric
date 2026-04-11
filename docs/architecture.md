@@ -9,10 +9,10 @@ PulseStream demonstrates a focused streaming architecture: high-volume event ing
 - `producer-simulator`: emits synthetic telemetry at configurable rates, including duplicates, malformed payloads, and burst traffic
 - `ingest-service`: validates event payloads, records rejections, publishes accepted events to Kafka, and emits ingest metrics
 - `raw archive`: immutable NDJSON event log written by ingest-service before broker publish, used for replay and backfills
-- `stream-processor`: consumes Kafka partitions, processes partitions in parallel while preserving per-partition ordering, deduplicates by `event_id`, computes hot aggregates, and stores per-instance service state snapshots
+- `stream-processor`: consumes Kafka partitions, processes partitions in parallel while preserving per-partition ordering, deduplicates by `event_id`, dead-letters poison messages that are already in Kafka, computes hot aggregates, and stores per-instance service state snapshots
 - `query-service`: exposes low-latency operational APIs for dashboard reads
 - `PostgreSQL`: hot store for aggregate buckets, source counters, rejection history, and service state
-- `Kafka`: durable broker between write and processing paths
+- `Kafka`: durable broker between write and processing paths, with a dedicated DLQ topic for processor-side poison messages
 - `dashboard`: React UI for throughput, lag, latency, and rejection visibility
 - `Prometheus` and `Grafana`: metrics collection and local operational visibility
 
@@ -21,6 +21,10 @@ PulseStream demonstrates a focused streaming architecture: high-volume event ing
 ### Write path
 
 `producer-simulator -> ingest-service -> raw archive + Kafka -> stream-processor -> PostgreSQL`
+
+Poison-message path:
+
+`Kafka -> stream-processor -> pulsestream.events.dlq`
 
 ### Read path
 
@@ -33,6 +37,7 @@ PulseStream demonstrates a focused streaming architecture: high-volume event ing
 - Idempotent at-least-once processing: `processed_events.event_id` acts as the duplicate guard without the complexity of exactly-once semantics
 - Partition-parallel processing in one processor instance: keeps ordering within a partition but allows different Kafka partitions to make progress concurrently
 - Instance-aware processor state aggregation: each processor replica writes its own heartbeat row and the query layer aggregates live replicas instead of assuming a single process
+- Fail-closed poison-message handling: processor-side decode and validation failures are written to a DLQ topic before the source offset is committed
 - Immutable raw archive before broker publish: keeps a replayable event history even if downstream processing needs to be rebuilt
 - Docker Compose before Kubernetes: faster iteration and easier benchmark reproducibility on a single developer machine
 
@@ -42,6 +47,16 @@ PulseStream demonstrates a focused streaming architecture: high-volume event ing
 - `source_metrics`: cumulative source activity for top-N reads
 - `rejection_events`: recent ingest failures for operator visibility
 - `service_state`: lightweight snapshots keyed by `service_name + instance_id`, with stale rows ignored by the query layer so dead replicas do not inflate live totals
+
+Processor snapshots currently include:
+
+- processed event count
+- duplicate discard count
+- dead-letter count
+- consumer lag
+- active partitions
+- in-flight message count
+- p50, p95, and p99 processing latency
 
 ## Observability
 

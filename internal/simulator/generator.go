@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,7 @@ import (
 
 type Config struct {
 	Endpoint         string
+	BearerToken      string
 	RatePerSecond    int
 	TenantCount      int
 	SourcesPerTenant int
@@ -177,6 +179,9 @@ func (g *Generator) sendOne(ctx context.Context, index int64) error {
 		return fmt.Errorf("build request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if token := strings.TrimSpace(g.config.BearerToken); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	response, err := g.client.Do(request)
 	if err != nil {

@@ -16,6 +16,7 @@ param(
     [string]$Endpoint = "http://localhost:8080/api/v1/events",
     [string]$ComposeIngestEndpoint = "http://ingest-service:8080/api/v1/events",
     [string]$OverviewEndpoint = "http://localhost:8081/api/v1/metrics/overview",
+    [string]$BearerToken = "",
     [string]$PrometheusEndpoint = "http://localhost:9090",
     [string]$SimulatorHealthEndpoint = "http://localhost:8083/healthz",
     [string]$ComposeFile = "deploy/docker-compose/docker-compose.yml",
@@ -29,8 +30,16 @@ $binDir = Join-Path $repoRoot "bin"
 $artifactDir = Join-Path $repoRoot "artifacts/benchmarks"
 $binaryPath = Join-Path $binDir "producer-simulator-bench.exe"
 $benchmarkContainerName = "pulsestream-benchmark-producer"
+$defaultBearerToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4iLCJpc3MiOiJwdWxzZXN0cmVhbS1sb2NhbCIsInN1YiI6ImxvY2FsLWFkbWluIiwiYXVkIjpbInB1bHNlc3RyZWFtLWxvY2FsIl0sImV4cCI6MjA5MTI3ODUwNiwiaWF0IjoxNzc1OTE4NTA2fQ.q__74RIQsNpC5AfZY6yr-6dwTAP8gybP2_4kB5NQ-Vs"
 
 New-Item -ItemType Directory -Force $binDir, $artifactDir | Out-Null
+
+if ([string]::IsNullOrWhiteSpace($BearerToken)) {
+    $BearerToken = $env:PULSESTREAM_BEARER_TOKEN
+}
+if ([string]::IsNullOrWhiteSpace($BearerToken)) {
+    $BearerToken = $defaultBearerToken
+}
 
 function Get-Percentile {
     param(
@@ -54,16 +63,32 @@ function Get-Percentile {
     return [double]$sorted[$index]
 }
 
+function Get-AuthHeaders {
+    param([string]$Token)
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return @{}
+    }
+
+    return @{ Authorization = "Bearer $Token" }
+}
+
 function Wait-HttpReady {
     param(
         [string]$Url,
+        [hashtable]$Headers = @{},
         [int]$TimeoutSeconds = 20
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         try {
-            Invoke-WebRequest -Uri $Url -UseBasicParsing | Out-Null
+            if ($Headers.Count -gt 0) {
+                Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing | Out-Null
+            }
+            else {
+                Invoke-WebRequest -Uri $Url -UseBasicParsing | Out-Null
+            }
             return $true
         }
         catch {
@@ -216,10 +241,19 @@ function Wait-PrometheusQueryExactValue {
 }
 
 function Get-OverviewSample {
-    param([string]$Url)
+    param(
+        [string]$Url,
+        [string]$Token
+    )
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $overview = Invoke-RestMethod -Uri $Url
+    $headers = Get-AuthHeaders -Token $Token
+    if ($headers.Count -gt 0) {
+        $overview = Invoke-RestMethod -Uri $Url -Headers $headers
+    }
+    else {
+        $overview = Invoke-RestMethod -Uri $Url
+    }
     $stopwatch.Stop()
 
     return [pscustomobject]@{
@@ -256,10 +290,11 @@ function Get-ServiceMetricsSnapshot {
 function Get-BenchmarkSample {
     param(
         [string]$OverviewUrl,
-        [string]$PrometheusBaseUrl
+        [string]$PrometheusBaseUrl,
+        [string]$Token
     )
 
-    $overviewSample = Get-OverviewSample -Url $OverviewUrl
+    $overviewSample = Get-OverviewSample -Url $OverviewUrl -Token $Token
 
     return [pscustomobject]@{
         timestamp_utc       = $overviewSample.timestamp_utc
@@ -283,6 +318,7 @@ function Save-Environment {
         SIM_BURST_EVERY          = $env:SIM_BURST_EVERY
         SIM_BURST_SIZE           = $env:SIM_BURST_SIZE
         SIM_INGEST_ENDPOINT      = $env:SIM_INGEST_ENDPOINT
+        SIM_BEARER_TOKEN         = $env:SIM_BEARER_TOKEN
         HTTP_ACCESS_LOG_ENABLED  = $env:HTTP_ACCESS_LOG_ENABLED
         OTEL_TRACES_EXPORTER     = $env:OTEL_TRACES_EXPORTER
         OTEL_TRACES_SAMPLE_RATIO = $env:OTEL_TRACES_SAMPLE_RATIO
@@ -391,7 +427,7 @@ try {
     if (-not (Wait-HttpReady -Url "$PrometheusEndpoint/-/ready" -TimeoutSeconds 30)) {
         throw "Prometheus did not become ready."
     }
-    if (-not (Wait-HttpReady -Url $OverviewEndpoint -TimeoutSeconds 30)) {
+    if (-not (Wait-HttpReady -Url $OverviewEndpoint -Headers (Get-AuthHeaders -Token $BearerToken) -TimeoutSeconds 30)) {
         throw "Query service overview endpoint did not become ready."
     }
     if (-not (Wait-PrometheusQueryExactValue -BaseUrl $PrometheusEndpoint -Query 'count(up{job="stream-processor"})' -ExpectedValue $ProcessorReplicas -TimeoutSeconds 60)) {
@@ -408,6 +444,7 @@ try {
         $env:SIM_BURST_EVERY = $BurstEvery
         $env:SIM_BURST_SIZE = "$BurstSize"
         $env:SIM_INGEST_ENDPOINT = $Endpoint
+        $env:SIM_BEARER_TOKEN = $BearerToken
         $env:HTTP_ACCESS_LOG_ENABLED = "false"
         $env:OTEL_TRACES_EXPORTER = "none"
 
@@ -437,6 +474,7 @@ try {
             --no-deps `
             --service-ports `
             -e SIM_INGEST_ENDPOINT=$ComposeIngestEndpoint `
+            -e SIM_BEARER_TOKEN=$BearerToken `
             -e SIM_RATE_PER_SEC=$Rate `
             -e SIM_TENANT_COUNT=$TenantCount `
             -e SIM_SOURCES_PER_TENANT=$SourcesPerTenant `
@@ -463,11 +501,11 @@ try {
     }
 
     $startMetrics = Get-ServiceMetricsSnapshot -PrometheusBaseUrl $PrometheusEndpoint
-    $startSample = Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint
+    $startSample = Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint -Token $BearerToken
 
     $deadline = (Get-Date).AddSeconds($DurationSeconds)
     while ((Get-Date) -lt $deadline) {
-        $samples += Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint
+        $samples += Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint -Token $BearerToken
         Start-Sleep -Milliseconds $SampleIntervalMilliseconds
     }
 

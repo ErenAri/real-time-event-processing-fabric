@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/segmentio/kafka-go"
 
+	"pulsestream/internal/deadletter"
 	"pulsestream/internal/events"
 )
 
@@ -39,6 +40,22 @@ func (f *fakeReader) CommitMessages(ctx context.Context, messages ...kafka.Messa
 
 func (f *fakeReader) Stats() kafka.ReaderStats {
 	return kafka.ReaderStats{}
+}
+
+type fakeDeadLetterPublisher struct {
+	mu      sync.Mutex
+	records []deadletter.Record
+	err     error
+}
+
+func (f *fakeDeadLetterPublisher) PublishDeadLetter(_ context.Context, record deadletter.Record) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, record)
+	return nil
 }
 
 type blockingStore struct {
@@ -110,7 +127,7 @@ func TestRunnerProcessesDifferentPartitionsInParallel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	runner := NewRunner(reader, store, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+	runner := NewRunner(reader, store, nil, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
 		PartitionQueueCapacity: 8,
 	})
 
@@ -152,4 +169,96 @@ func TestRunnerProcessesDifferentPartitionsInParallel(t *testing.T) {
 
 func nilLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestRunnerDeadLettersMalformedMessageAndCommitsIt(t *testing.T) {
+	reader := &fakeReader{}
+	dlq := &fakeDeadLetterPublisher{}
+	runner := NewRunner(reader, nil, dlq, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		ConsumerGroup: "pulsestream-processor",
+	})
+
+	message := kafka.Message{
+		Topic:     "pulsestream.events",
+		Partition: 1,
+		Offset:    42,
+		Key:       []byte("tenant_01:sensor_001"),
+		Value:     []byte(`{"schema_version":1`),
+	}
+
+	if err := runner.handleMessage(context.Background(), message); err != nil {
+		t.Fatalf("handle malformed message: %v", err)
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	if len(reader.committed) != 1 {
+		t.Fatalf("expected malformed message to be committed after DLQ publish, got %d commits", len(reader.committed))
+	}
+	if len(dlq.records) != 1 {
+		t.Fatalf("expected one dead-letter record, got %d", len(dlq.records))
+	}
+	if dlq.records[0].Reason != "decode_failed" {
+		t.Fatalf("expected decode_failed reason, got %q", dlq.records[0].Reason)
+	}
+	if runner.deadLetterTotal.Load() != 1 {
+		t.Fatalf("expected dead-letter total to be 1, got %d", runner.deadLetterTotal.Load())
+	}
+}
+
+func TestRunnerDeadLettersValidationFailureAndCommitsIt(t *testing.T) {
+	reader := &fakeReader{}
+	dlq := &fakeDeadLetterPublisher{}
+	runner := NewRunner(reader, nil, dlq, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		ConsumerGroup: "pulsestream-processor",
+	})
+
+	payload := []byte(`{"schema_version":1,"event_id":"evt-1","tenant_id":"tenant_01","source_id":"sensor_001","event_type":"telemetry","timestamp":"2026-04-11T13:00:00Z","value":5,"status":"ok","region":"eu-west","sequence":0}`)
+	message := kafka.Message{
+		Topic:     "pulsestream.events",
+		Partition: 0,
+		Offset:    7,
+		Key:       []byte("tenant_01:sensor_001"),
+		Value:     payload,
+	}
+
+	if err := runner.handleMessage(context.Background(), message); err != nil {
+		t.Fatalf("handle invalid message: %v", err)
+	}
+
+	if len(dlq.records) != 1 {
+		t.Fatalf("expected one dead-letter record, got %d", len(dlq.records))
+	}
+	if dlq.records[0].Reason != "validation_failed" {
+		t.Fatalf("expected validation_failed reason, got %q", dlq.records[0].Reason)
+	}
+	if dlq.records[0].TenantID != "tenant_01" {
+		t.Fatalf("expected tenant metadata on dead-letter record, got %q", dlq.records[0].TenantID)
+	}
+}
+
+func TestRunnerReturnsErrorWhenDeadLetterPublishFails(t *testing.T) {
+	reader := &fakeReader{}
+	dlq := &fakeDeadLetterPublisher{err: context.DeadlineExceeded}
+	runner := NewRunner(reader, nil, dlq, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		ConsumerGroup: "pulsestream-processor",
+	})
+
+	message := kafka.Message{
+		Topic:     "pulsestream.events",
+		Partition: 1,
+		Offset:    42,
+		Key:       []byte("tenant_01:sensor_001"),
+		Value:     []byte(`{"schema_version":1`),
+	}
+
+	if err := runner.handleMessage(context.Background(), message); err == nil {
+		t.Fatal("expected dead-letter publish failure to bubble up")
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	if len(reader.committed) != 0 {
+		t.Fatalf("expected zero commits when dead-letter publish fails, got %d", len(reader.committed))
+	}
 }

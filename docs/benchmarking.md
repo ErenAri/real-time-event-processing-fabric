@@ -2,7 +2,7 @@
 
 ## Goal
 
-The MVP benchmark gate is `5k events/sec` sustained with live dashboard freshness under 2 seconds and no correctness regression in duplicate handling.
+The MVP benchmark gate is `5k events/sec` sustained with live dashboard freshness under 2 seconds and no correctness regression in duplicate handling or poison-message containment.
 
 ## Local benchmark procedure
 
@@ -43,6 +43,7 @@ The MVP benchmark gate is `5k events/sec` sustained with live dashboard freshnes
 - processing latency p50, p95, p99
 - rejection rate
 - duplicate discard count
+- dead-letter count
 - observed processor replica count
 - summed active partitions and in-flight backlog across processor replicas
 
@@ -66,6 +67,7 @@ Fill this table after each benchmark run.
 - The scale-aware benchmark harness now compares `1` vs `3` processor replicas under the same script behavior. In the latest pair of runs, `3` replicas improved processed throughput from `568.43 eps` to `595.02 eps`, while also improving `p95`/`p99` latency from `14/23 ms` to `11/19 ms`.
 - The latest pair also shows the current ceiling is no longer purely processor-side in this profile: the offered producer rate settled around `700-860 eps`, so the next benchmark pass should raise producer capacity or parallelism if the goal is to isolate processor scaling more aggressively.
 - On Windows, a host-native benchmark producer materially under-reported throughput compared with the Compose-network producer path, so `-ProducerMode compose` is the baseline method for published evidence.
+- Poison-message handling is verified separately from the throughput harness in `artifacts/failure-drills/dead-letter-verification-20260411-1509.json` so malformed direct-to-Kafka records can be tested without distorting the hot benchmark stream.
 
 ## Next bottleneck
 

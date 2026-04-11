@@ -31,6 +31,15 @@
 - Expected behavior: ingest returns `400`, records rejection rows, and continues serving valid traffic
 - Evidence to capture: rejection timeline and `pulsestream_ingest_rejected_total`
 
+## Poison message already in Kafka
+
+- Trigger: `./scripts/chaos/inject-poison-message.ps1` or write a malformed or semantically invalid record directly to Kafka
+- Expected behavior: processor publishes one DLQ record, commits the source offset only after the DLQ write succeeds, and increments `dead_letter_total`
+- Observed drill: `artifacts/failure-drills/dead-letter-verification-20260411-1509.json`
+- Observed behavior: a malformed record written to `pulsestream.verify.events` was logged as `message_dead_lettered`, published to `pulsestream.verify.events.dlq`, and moved the overview API from `dead_letter_total: 0` to `dead_letter_total: 1`
+- Observed behavior: the DLQ record captured the failure reason, source topic, source offset, consumer group, and base64-encoded original payload
+- Interpretation: processor-side poison messages are isolated without blocking the consumer loop, and the operator path can see the event through both the overview API and the DLQ topic
+
 ## PostgreSQL pause or slowdown
 
 - Trigger: `./scripts/chaos/pause-postgres.ps1`

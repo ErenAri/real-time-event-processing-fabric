@@ -54,7 +54,21 @@ The archive is stored in the ingest container at `/var/lib/pulsestream/archive` 
 2. Inspect `pulsestream_ingest_rejected_total` by `reason`.
 3. Confirm whether the simulator is intentionally emitting malformed payloads or if Kafka publishing is failing.
 
+## Investigate dead-letter activity
+
+1. Query `GET /api/v1/metrics/overview` and check `dead_letter_total`.
+2. Inspect processor logs for `message_dead_lettered`.
+3. Read the DLQ topic from Kafka:
+
+```powershell
+docker exec docker-compose-kafka-1 sh -lc `
+  "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic pulsestream.events.dlq --from-beginning --max-messages 10 --timeout-ms 5000"
+```
+
+4. Confirm the DLQ record contains the expected source topic, source offset, consumer group, and reason before deciding whether to replay or discard the source data.
+
 ## Recovery drills
 
 - Restart processor: `./scripts/chaos/restart-processor.ps1`
+- Inject poison message: `./scripts/chaos/inject-poison-message.ps1 -Topic pulsestream.verify.events -OutputPath artifacts/failure-drills/inject-poison-message.json`
 - Pause Postgres: `./scripts/chaos/pause-postgres.ps1`

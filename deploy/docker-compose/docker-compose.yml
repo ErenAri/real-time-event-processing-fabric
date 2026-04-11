@@ -46,7 +46,8 @@ services:
       args:
         SERVICE_PATH: services/ingest-service
     environment:
-      POSTGRES_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
+      POSTGRES_URL: postgres://pulsestream_app:pulsestream_app@postgres:5432/pulsestream?sslmode=disable
+      POSTGRES_ADMIN_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: pulsestream.events
       KAFKA_BATCH_TIMEOUT: 5ms
@@ -54,6 +55,9 @@ services:
       INGEST_LISTEN_ADDR: :8080
       RAW_ARCHIVE_DIR: /var/lib/pulsestream/archive
       ADMIN_TOKEN: pulsestream-dev-admin
+      AUTH_JWT_SECRET: pulsestream-dev-secret
+      AUTH_JWT_ISSUER: pulsestream-local
+      AUTH_JWT_AUDIENCE: pulsestream-local
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,9 +82,11 @@ services:
       args:
         SERVICE_PATH: services/stream-processor
     environment:
-      POSTGRES_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
+      POSTGRES_URL: postgres://pulsestream_app:pulsestream_app@postgres:5432/pulsestream?sslmode=disable
+      POSTGRES_ADMIN_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: pulsestream.events
+      KAFKA_DLQ_TOPIC: pulsestream.events.dlq
       KAFKA_GROUP_ID: pulsestream-processor
       PROCESSOR_LISTEN_ADDR: :8082
     depends_on:
@@ -105,8 +111,12 @@ services:
       args:
         SERVICE_PATH: services/query-service
     environment:
-      POSTGRES_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
+      POSTGRES_URL: postgres://pulsestream_app:pulsestream_app@postgres:5432/pulsestream?sslmode=disable
+      POSTGRES_ADMIN_URL: postgres://postgres:postgres@postgres:5432/pulsestream?sslmode=disable
       QUERY_LISTEN_ADDR: :8081
+      AUTH_JWT_SECRET: pulsestream-dev-secret
+      AUTH_JWT_ISSUER: pulsestream-local
+      AUTH_JWT_AUDIENCE: pulsestream-local
     depends_on:
       postgres:
         condition: service_healthy
@@ -128,6 +138,7 @@ services:
         SERVICE_PATH: services/producer-simulator
     environment:
       SIM_INGEST_ENDPOINT: http://ingest-service:8080/api/v1/events
+      SIM_BEARER_TOKEN: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4iLCJpc3MiOiJwdWxzZXN0cmVhbS1sb2NhbCIsInN1YiI6ImxvY2FsLWFkbWluIiwiYXVkIjpbInB1bHNlc3RyZWFtLWxvY2FsIl0sImV4cCI6MjA5MTI3ODUwNiwiaWF0IjoxNzc1OTE4NTA2fQ.q__74RIQsNpC5AfZY6yr-6dwTAP8gybP2_4kB5NQ-Vs
       SIMULATOR_LISTEN_ADDR: :8083
       SIM_RATE_PER_SEC: 1000
       SIM_TENANT_COUNT: 5
@@ -153,6 +164,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker-compose/Dockerfile.dashboard
+      args:
+        VITE_API_BASE_URL: http://localhost:8081
+        VITE_API_BEARER_TOKEN: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4iLCJpc3MiOiJwdWxzZXN0cmVhbS1sb2NhbCIsInN1YiI6ImxvY2FsLWFkbWluIiwiYXVkIjpbInB1bHNlc3RyZWFtLWxvY2FsIl0sImV4cCI6MjA5MTI3ODUwNiwiaWF0IjoxNzc1OTE4NTA2fQ.q__74RIQsNpC5AfZY6yr-6dwTAP8gybP2_4kB5NQ-Vs
     depends_on:
       query-service:
         condition: service_started

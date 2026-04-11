@@ -37,8 +37,10 @@ func run() error {
 	listenAddr := platform.EnvString("PROCESSOR_LISTEN_ADDR", ":8082")
 	brokers := platform.EnvCSV("KAFKA_BROKERS", []string{"localhost:9092"})
 	topic := platform.EnvString("KAFKA_TOPIC", "pulsestream.events")
+	dlqTopic := platform.EnvString("KAFKA_DLQ_TOPIC", "")
 	groupID := platform.EnvString("KAFKA_GROUP_ID", "pulsestream-processor")
 	postgresURL := platform.EnvString("POSTGRES_URL", "postgres://postgres:postgres@localhost:5432/pulsestream?sslmode=disable")
+	postgresAdminURL := platform.EnvString("POSTGRES_ADMIN_URL", "")
 	instanceID := platform.EnvInstanceID("SERVICE_INSTANCE_ID", "stream-processor")
 	partitionQueueCapacity, err := platform.EnvInt("PROCESSOR_PARTITION_QUEUE_CAPACITY", 256)
 	if err != nil {
@@ -49,7 +51,7 @@ func run() error {
 		return err
 	}
 
-	storage, err := store.New(ctx, postgresURL)
+	storage, err := store.NewWithAdmin(ctx, postgresURL, postgresAdminURL)
 	if err != nil {
 		return err
 	}
@@ -58,11 +60,18 @@ func run() error {
 	reader := platform.NewKafkaReader(brokers, topic, groupID)
 	defer reader.Close()
 
+	var dlqPublisher platform.DeadLetterPublisher
+	if dlqTopic != "" {
+		dlqPublisher = platform.NewKafkaDeadLetterPublisher(brokers, dlqTopic, platform.KafkaPublisherConfig{})
+		defer dlqPublisher.Close()
+	}
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 
-	runner := processor.NewRunner(reader, storage, logger, registry, processor.RunnerConfig{
+	runner := processor.NewRunner(reader, storage, dlqPublisher, logger, registry, processor.RunnerConfig{
 		PartitionQueueCapacity: partitionQueueCapacity,
+		ConsumerGroup:          groupID,
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
@@ -110,6 +119,7 @@ func run() error {
 		"service_starting",
 		"listen_addr", listenAddr,
 		"kafka_topic", topic,
+		"kafka_dlq_topic", dlqTopic,
 		"group_id", groupID,
 		"instance_id", instanceID,
 		"partition_queue_capacity", partitionQueueCapacity,

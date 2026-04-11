@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"pulsestream/internal/auth"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
 )
@@ -25,6 +26,7 @@ type MetricsReader interface {
 type QueryHandler struct {
 	logger        *slog.Logger
 	reader        MetricsReader
+	verifier      *auth.Verifier
 	startedAt     time.Time
 	requestsTotal atomic.Int64
 
@@ -32,10 +34,11 @@ type QueryHandler struct {
 	requests     prometheus.Counter
 }
 
-func NewQueryHandler(logger *slog.Logger, reader MetricsReader, registry *prometheus.Registry) *QueryHandler {
+func NewQueryHandler(logger *slog.Logger, reader MetricsReader, verifier *auth.Verifier, registry *prometheus.Registry) *QueryHandler {
 	handler := &QueryHandler{
 		logger:    logger,
 		reader:    reader,
+		verifier:  verifier,
 		startedAt: time.Now().UTC(),
 		queryLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "pulsestream_query_request_duration_seconds",
@@ -79,7 +82,12 @@ func (h *QueryHandler) wrap(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *QueryHandler) handleOverview(w http.ResponseWriter, r *http.Request) {
-	overview, err := h.reader.GetOverview(r.Context())
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+
+	overview, err := h.reader.GetOverview(auth.ContextWithPrincipal(r.Context(), principal))
 	if err != nil {
 		h.logger.Error("overview_query_failed", "error", err)
 		platform.WriteError(w, http.StatusInternalServerError, "failed to load overview")
@@ -89,9 +97,18 @@ func (h *QueryHandler) handleOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *QueryHandler) handleTenantSeries(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+
 	tenantID := strings.TrimPrefix(r.URL.Path, "/api/v1/metrics/tenants/")
 	if tenantID == "" {
 		platform.WriteError(w, http.StatusBadRequest, "tenant id is required")
+		return
+	}
+	if principal.Role == auth.RoleTenantUser && tenantID != principal.TenantID {
+		platform.WriteError(w, http.StatusForbidden, "token tenant does not match requested tenant")
 		return
 	}
 
@@ -105,7 +122,7 @@ func (h *QueryHandler) handleTenantSeries(w http.ResponseWriter, r *http.Request
 		window = parsed
 	}
 
-	series, err := h.reader.GetTenantSeries(r.Context(), tenantID, window)
+	series, err := h.reader.GetTenantSeries(auth.ContextWithPrincipal(r.Context(), principal), tenantID, window)
 	if err != nil {
 		h.logger.Error("tenant_series_query_failed", "error", err, "tenant_id", tenantID)
 		platform.WriteError(w, http.StatusInternalServerError, "failed to load tenant series")
@@ -119,7 +136,21 @@ func (h *QueryHandler) handleTenantSeries(w http.ResponseWriter, r *http.Request
 }
 
 func (h *QueryHandler) handleTopSources(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+
 	tenantID := r.URL.Query().Get("tenantId")
+	if principal.Role == auth.RoleTenantUser {
+		switch {
+		case tenantID == "":
+			tenantID = principal.TenantID
+		case tenantID != principal.TenantID:
+			platform.WriteError(w, http.StatusForbidden, "token tenant does not match requested tenant")
+			return
+		}
+	}
 	limit := 10
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -130,7 +161,7 @@ func (h *QueryHandler) handleTopSources(w http.ResponseWriter, r *http.Request) 
 		limit = parsed
 	}
 
-	sources, err := h.reader.GetTopSources(r.Context(), tenantID, limit)
+	sources, err := h.reader.GetTopSources(auth.ContextWithPrincipal(r.Context(), principal), tenantID, limit)
 	if err != nil {
 		h.logger.Error("top_sources_query_failed", "error", err)
 		platform.WriteError(w, http.StatusInternalServerError, "failed to load top sources")
@@ -143,6 +174,11 @@ func (h *QueryHandler) handleTopSources(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *QueryHandler) handleRejections(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+
 	limit := 10
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -153,11 +189,24 @@ func (h *QueryHandler) handleRejections(w http.ResponseWriter, r *http.Request) 
 		limit = parsed
 	}
 
-	rejections, err := h.reader.RecentRejections(r.Context(), limit)
+	rejections, err := h.reader.RecentRejections(auth.ContextWithPrincipal(r.Context(), principal), limit)
 	if err != nil {
 		h.logger.Error("rejections_query_failed", "error", err)
 		platform.WriteError(w, http.StatusInternalServerError, "failed to load recent rejections")
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{"rejections": rejections})
+}
+
+func (h *QueryHandler) authenticateRequest(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	if h.verifier == nil {
+		return auth.Principal{Role: auth.RoleAdmin, Subject: "auth-disabled"}, true
+	}
+
+	principal, err := h.verifier.ParseRequest(r)
+	if err != nil {
+		platform.WriteError(w, http.StatusUnauthorized, "bearer token is required")
+		return auth.Principal{}, false
+	}
+	return principal, true
 }

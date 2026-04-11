@@ -47,6 +47,30 @@ Response `400 Bad Request`:
 
 Returns platform-wide throughput, lag, latency, and recent rejection information.
 
+Representative response:
+
+```json
+{
+  "accepted_total": 471893,
+  "rejected_total": 949,
+  "processed_total": 6206185,
+  "duplicate_total": 0,
+  "dead_letter_total": 1,
+  "consumer_lag": 0,
+  "processor_instances": 1,
+  "processor_active_partitions": 1,
+  "processor_inflight_messages": 0,
+  "processing_p95_ms": 0,
+  "recent_rejections": [
+    {
+      "id": 120911,
+      "reason": "decode_failed",
+      "created_at": "2026-04-11T15:09:06.031708Z"
+    }
+  ]
+}
+```
+
 ### `GET /api/v1/metrics/tenants/{tenantId}?window=15m`
 
 Returns 10-second buckets for the requested tenant.
@@ -104,6 +128,10 @@ Each Go service exposes:
 
 ## Auth
 
-The MVP is intentionally unauthenticated inside the local Compose environment. JWT auth and tenant-scoped authorization are reserved for the next gate after throughput and failure evidence are stable.
+The local stack requires JWT bearer tokens for ingest and query endpoints.
 
-The replay endpoint is the one exception: it uses a local shared admin token so replay is not anonymously exposed in the dev environment.
+- `admin` tokens can query any tenant and call replay endpoints
+- `tenant_user` tokens are restricted to their own `tenant_id`
+- `GET /healthz`, `GET /readyz`, and `GET /metrics` remain unauthenticated
+
+The replay endpoint accepts `Authorization: Bearer <token>` for admin JWTs and still accepts `X-Admin-Token` for local recovery drills.

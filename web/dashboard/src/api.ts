@@ -7,9 +7,22 @@ import type {
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8081";
+const API_BEARER_TOKEN =
+  import.meta.env.VITE_API_BEARER_TOKEN?.trim() ?? "";
+
+function buildHeaders(): HeadersInit {
+  if (!API_BEARER_TOKEN) {
+    return {};
+  }
+  return {
+    Authorization: `Bearer ${API_BEARER_TOKEN}`,
+  };
+}
 
 async function fetchJSON<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`);
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    headers: buildHeaders(),
+  });
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }

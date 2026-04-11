@@ -20,6 +20,7 @@ func aggregateIngestStates(states []stateEnvelope) IngestState {
 
 type processorAggregate struct {
 	DuplicateTotal   int64
+	DeadLetterTotal  int64
 	ConsumerLag      int64
 	InstanceCount    int
 	ActivePartitions int64
@@ -39,6 +40,7 @@ func aggregateProcessorStates(states []stateEnvelope) processorAggregate {
 
 		aggregate.InstanceCount++
 		aggregate.DuplicateTotal += state.Processor.DuplicateTotal
+		aggregate.DeadLetterTotal += state.Processor.DeadLetterTotal
 		aggregate.ConsumerLag += state.Processor.ConsumerLag
 		aggregate.ActivePartitions += state.Processor.ActivePartitions
 		aggregate.InFlightMessages += state.Processor.InFlightMessages

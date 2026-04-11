@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	eventarchive "pulsestream/internal/archive"
+	"pulsestream/internal/auth"
 	"pulsestream/internal/events"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
@@ -42,6 +43,7 @@ type IngestHandler struct {
 	rejectionStore RejectionRecorder
 	archiver       RawArchiver
 	replayer       RawReplayer
+	verifier       *auth.Verifier
 	adminToken     string
 	startedAt      time.Time
 
@@ -63,6 +65,7 @@ func NewIngestHandler(
 	rejectionStore RejectionRecorder,
 	archiver RawArchiver,
 	replayer RawReplayer,
+	verifier *auth.Verifier,
 	adminToken string,
 	registry *prometheus.Registry,
 ) *IngestHandler {
@@ -72,6 +75,7 @@ func NewIngestHandler(
 		rejectionStore: rejectionStore,
 		archiver:       archiver,
 		replayer:       replayer,
+		verifier:       verifier,
 		adminToken:     strings.TrimSpace(adminToken),
 		startedAt:      time.Now().UTC(),
 		requestDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -159,16 +163,23 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principal, ok := h.authorizeEventIngest(w, r, event.TenantID)
+	if !ok {
+		return
+	}
+
 	if err := event.Validate(); err != nil {
 		h.reject(r.Context(), body, event.TenantID, event.SourceID, "validation_failed")
 		platform.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	ctx := auth.ContextWithPrincipal(r.Context(), principal)
+
 	if h.archiver != nil {
 		archiveStart := time.Now()
-		if err := h.archiver.Archive(r.Context(), event, body); err != nil {
-			h.reject(r.Context(), body, event.TenantID, event.SourceID, "archive_failed")
+		if err := h.archiver.Archive(ctx, event, body); err != nil {
+			h.reject(ctx, body, event.TenantID, event.SourceID, "archive_failed")
 			h.logger.Error("archive_event_failed", "error", err, "tenant_id", event.TenantID, "source_id", event.SourceID)
 			platform.WriteError(w, http.StatusBadGateway, "failed to archive event")
 			return
@@ -178,8 +189,8 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	publishStart := time.Now()
-	if err := h.publisher.PublishEvent(r.Context(), event); err != nil {
-		h.reject(r.Context(), body, event.TenantID, event.SourceID, "publish_failed")
+	if err := h.publisher.PublishEvent(ctx, event); err != nil {
+		h.reject(ctx, body, event.TenantID, event.SourceID, "publish_failed")
 		h.logger.Error("publish_event_failed", "error", err, "tenant_id", event.TenantID, "source_id", event.SourceID)
 		platform.WriteError(w, http.StatusBadGateway, "failed to publish event")
 		return
@@ -204,8 +215,8 @@ func (h *IngestHandler) handleReplay(w http.ResponseWriter, r *http.Request) {
 		platform.WriteError(w, http.StatusServiceUnavailable, "replay is not configured")
 		return
 	}
-	if !h.authorizeAdmin(r) {
-		platform.WriteError(w, http.StatusUnauthorized, "admin token is required")
+	principal, ok := h.authorizeReplay(w, r)
+	if !ok {
 		return
 	}
 
@@ -247,7 +258,8 @@ func (h *IngestHandler) handleReplay(w http.ResponseWriter, r *http.Request) {
 		TenantID:  strings.TrimSpace(request.TenantID),
 		Limit:     request.Limit,
 	}
-	result, err := h.replayer.Replay(r.Context(), filter, h.publisher.PublishEvent)
+	ctx := auth.ContextWithPrincipal(r.Context(), principal)
+	result, err := h.replayer.Replay(ctx, filter, h.publisher.PublishEvent)
 	if err != nil {
 		h.logger.Error("replay_archive_failed", "error", err, "tenant_id", filter.TenantID)
 		platform.WriteError(w, http.StatusBadGateway, "failed to replay archived events")
@@ -292,7 +304,52 @@ func (h *IngestHandler) reject(ctx context.Context, payload []byte, tenantID str
 	}
 }
 
-func (h *IngestHandler) authorizeAdmin(r *http.Request) bool {
+func (h *IngestHandler) authorizeEventIngest(w http.ResponseWriter, r *http.Request, tenantID string) (auth.Principal, bool) {
+	principal, err := h.authenticateRequest(r)
+	if err != nil {
+		platform.WriteError(w, http.StatusUnauthorized, "bearer token is required")
+		return auth.Principal{}, false
+	}
+
+	switch principal.Role {
+	case auth.RoleAdmin:
+		return principal, true
+	case auth.RoleTenantUser:
+		if strings.TrimSpace(tenantID) == "" || principal.TenantID != strings.TrimSpace(tenantID) {
+			platform.WriteError(w, http.StatusForbidden, "token tenant does not match event tenant")
+			return auth.Principal{}, false
+		}
+		return principal, true
+	default:
+		platform.WriteError(w, http.StatusForbidden, "role is not allowed to publish events")
+		return auth.Principal{}, false
+	}
+}
+
+func (h *IngestHandler) authorizeReplay(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	if h.verifier != nil {
+		principal, err := h.verifier.ParseRequest(r)
+		if err == nil && principal.Role == auth.RoleAdmin {
+			return principal, true
+		}
+	}
+
+	if h.authorizeAdminToken(r) {
+		return auth.Principal{Role: auth.RoleAdmin, Subject: "legacy-admin-token"}, true
+	}
+
+	platform.WriteError(w, http.StatusUnauthorized, "admin token is required")
+	return auth.Principal{}, false
+}
+
+func (h *IngestHandler) authenticateRequest(r *http.Request) (auth.Principal, error) {
+	if h.verifier == nil {
+		return auth.Principal{Role: auth.RoleAdmin, Subject: "auth-disabled"}, nil
+	}
+	return h.verifier.ParseRequest(r)
+}
+
+func (h *IngestHandler) authorizeAdminToken(r *http.Request) bool {
 	if h.adminToken == "" {
 		return false
 	}

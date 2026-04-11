@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"pulsestream/internal/api"
 	eventarchive "pulsestream/internal/archive"
+	"pulsestream/internal/auth"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
 	"pulsestream/internal/telemetry"
@@ -39,8 +41,12 @@ func run() error {
 	brokers := platform.EnvCSV("KAFKA_BROKERS", []string{"localhost:9092"})
 	topic := platform.EnvString("KAFKA_TOPIC", "pulsestream.events")
 	postgresURL := platform.EnvString("POSTGRES_URL", "postgres://postgres:postgres@localhost:5432/pulsestream?sslmode=disable")
+	postgresAdminURL := platform.EnvString("POSTGRES_ADMIN_URL", "")
 	rawArchiveDir := platform.EnvString("RAW_ARCHIVE_DIR", "data/raw-archive")
 	adminToken := platform.EnvString("ADMIN_TOKEN", "pulsestream-dev-admin")
+	jwtSecret := platform.EnvString("AUTH_JWT_SECRET", "")
+	jwtIssuer := platform.EnvString("AUTH_JWT_ISSUER", "")
+	jwtAudience := platform.EnvString("AUTH_JWT_AUDIENCE", "")
 	instanceID := platform.EnvInstanceID("SERVICE_INSTANCE_ID", "ingest-service")
 	kafkaBatchTimeout, err := platform.EnvDuration("KAFKA_BATCH_TIMEOUT", 5*time.Millisecond)
 	if err != nil {
@@ -55,11 +61,19 @@ func run() error {
 		return err
 	}
 
-	storage, err := store.New(ctx, postgresURL)
+	storage, err := store.NewWithAdmin(ctx, postgresURL, postgresAdminURL)
 	if err != nil {
 		return err
 	}
 	defer storage.Close()
+
+	var verifier *auth.Verifier
+	if strings.TrimSpace(jwtSecret) != "" {
+		verifier, err = auth.NewVerifier(jwtSecret, jwtIssuer, jwtAudience)
+		if err != nil {
+			return err
+		}
+	}
 
 	publisher := platform.NewKafkaPublisher(brokers, topic, platform.KafkaPublisherConfig{
 		BatchTimeout: kafkaBatchTimeout,
@@ -72,7 +86,7 @@ func run() error {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 
-	handler := api.NewIngestHandler(logger, publisher, storage, archiver, archiver, adminToken, registry)
+	handler := api.NewIngestHandler(logger, publisher, storage, archiver, archiver, verifier, adminToken, registry)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

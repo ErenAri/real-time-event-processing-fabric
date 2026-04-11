@@ -43,6 +43,7 @@ type IngestState struct {
 type ProcessorState struct {
 	ProcessedTotal   int64     `json:"processed_total"`
 	DuplicateTotal   int64     `json:"duplicate_total"`
+	DeadLetterTotal  int64     `json:"dead_letter_total"`
 	ConsumerLag      int64     `json:"consumer_lag"`
 	ActivePartitions int64     `json:"active_partitions"`
 	InFlightMessages int64     `json:"inflight_messages"`
@@ -65,6 +66,7 @@ type Overview struct {
 	RejectedTotal       int64             `json:"rejected_total"`
 	ProcessedTotal      int64             `json:"processed_total"`
 	DuplicateTotal      int64             `json:"duplicate_total"`
+	DeadLetterTotal     int64             `json:"dead_letter_total"`
 	ConsumerLag         int64             `json:"consumer_lag"`
 	ProcessorInstances  int               `json:"processor_instances"`
 	ActivePartitions    int64             `json:"processor_active_partitions"`

@@ -5,7 +5,7 @@ PulseStream is a real-time event analytics platform built to demonstrate streami
 ## MVP scope
 
 - Go services for ingest, stream processing, query, and synthetic load generation
-- Kafka-backed event pipeline with idempotent-at-least-once processing
+- Kafka-backed event pipeline with idempotent-at-least-once processing and poison-message dead-lettering
 - PostgreSQL hot views for tenant and source aggregates
 - Immutable raw-event archive plus admin replay for recovery and backfills
 - React + Vite live dashboard polling the query service every 2 seconds
@@ -45,11 +45,11 @@ scripts/
 
 2. Open the live surfaces:
 
-   - Dashboard: `http://localhost:4173`
-   - Query API: `http://localhost:8081/api/v1/metrics/overview`
-   - Ingest API: `http://localhost:8080/api/v1/events`
-   - Prometheus: `http://localhost:9090`
-   - Grafana: `http://localhost:3000` with `admin` / `admin`
+    - Dashboard: `http://localhost:4173`
+    - Query API: `http://localhost:8081/api/v1/metrics/overview` with `Authorization: Bearer <jwt>`
+    - Ingest API: `http://localhost:8080/api/v1/events`
+    - Prometheus: `http://localhost:9090`
+    - Grafana: `http://localhost:3000` with `admin` / `admin`
 
 3. Run the benchmark driver:
 
@@ -57,7 +57,20 @@ scripts/
    ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 60 -ProcessorReplicas 3
    ```
 
-   The benchmark driver defaults to a one-off Compose-network producer so the published artifacts are not distorted by Windows host networking. It can also scale the processor service before a run and records the observed replica count in the artifact.
+    The benchmark driver defaults to a one-off Compose-network producer so the published artifacts are not distorted by Windows host networking. It can also scale the processor service before a run and records the observed replica count in the artifact.
+
+## Local auth
+
+JWT auth and tenant-scoped authorization are enabled in the local stack. The dashboard and simulator images are built with a development admin token so the default operator path works after `docker compose up`.
+
+For manual API access, mint a token with the local development secret:
+
+```powershell
+go run ./cmd/dev-token `
+  -role admin `
+  -subject local-admin `
+  -secret pulsestream-dev-secret
+```
 
 ## Current architecture
 
@@ -74,6 +87,7 @@ graph TD
 
     subgraph Storage & Broker
         K[Kafka<br>pulsestream.events]
+        DLQ[Kafka DLQ<br>pulsestream.events.dlq]
         DB[(PostgreSQL<br>Hot Views, State, Rejections)]
     end
 
@@ -91,6 +105,7 @@ graph TD
     IS -->|Publish Event| K
     
     K -->|Consume| SP
+    SP -->|Poison Records| DLQ
     SP -->|Aggregate / Upsert| DB
     
     UI -->|Polls every 2s| QS
@@ -106,9 +121,11 @@ graph TD
 
 ## Status
 
-The codebase implements the MVP pipeline and local platform wiring. Tenant auth, replay jobs, Redis caching, and cloud deployment remain explicitly out of MVP and are called out as follow-on work in the docs.
+The codebase implements the MVP pipeline, local platform wiring, JWT auth, tenant-scoped authorization, PostgreSQL row-level security, and poison-message dead-lettering. Replay jobs, Redis caching, and cloud deployment remain follow-on work.
 
 Current benchmark evidence shows the ingest path sustaining roughly `1.2k accepted eps` and the optimized processor sustaining roughly `876 processed eps` under the documented Compose benchmark profile. The repo now also has scale-aware evidence for processor replicas: under the current exact-count harness, a `3`-replica processor run processed `595.02 eps` versus `568.43 eps` for `1` replica, with better `p95`/`p99` latency and slightly lower peak lag. The next engineering gap is raising producer-side offered load so processor scaling can be measured under a harder sustained profile.
+ 
+Poison-message handling is now verified in an isolated drill artifact at `artifacts/failure-drills/dead-letter-verification-20260411-1509.json`: a malformed record written directly to Kafka was consumed by the processor, published to the DLQ topic, and surfaced through `dead_letter_total` in the overview API.
 
 ## Admin replay
 
