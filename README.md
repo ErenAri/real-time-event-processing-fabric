@@ -33,6 +33,7 @@ schemas/
 deploy/docker-compose/
 docs/
 scripts/
+asyncapi.yaml
 ```
 
 ## Quick start
@@ -58,6 +59,23 @@ scripts/
    ```
 
     The benchmark driver defaults to a one-off Compose-network producer so the published artifacts are not distorted by Windows host networking. It can also scale the processor service before a run and records the observed replica count in the artifact.
+
+4. Run the poison-message drill:
+
+   ```powershell
+   ./scripts/chaos/inject-poison-message.ps1
+   ```
+
+   The drill pauses the compose simulator, launches a temporary processor with a fresh consumer group at the current topic tail, writes one malformed record directly to Kafka, and captures the resulting `dead_letter_total` delta as a JSON artifact.
+
+5. Validate the asynchronous contract:
+
+   ```powershell
+   npm install
+   npm run contract:validate
+   ```
+
+   The contract is defined in [asyncapi.yaml](/C:/Projects/real-time-event-processing-fabric/asyncapi.yaml) and reuses the JSON Schemas under [schemas/](/C:/Projects/real-time-event-processing-fabric/schemas).
 
 ## Local auth
 
@@ -112,6 +130,13 @@ graph TD
     QS -->|Query| DB
 ```
 
+## Contract governance
+
+- [asyncapi.yaml](/C:/Projects/real-time-event-processing-fabric/asyncapi.yaml) documents the Kafka topics, operations, headers, and examples for `pulsestream.events` and `pulsestream.events.dlq`
+- [telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json) is the source payload schema for accepted telemetry events
+- [dead-letter-record-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/dead-letter-record-v1.schema.json) defines the processor-side poison-message payload
+- GitHub Actions validates the AsyncAPI document on every push and pull request
+
 ## Evidence goals
 
 - Throughput target: `5k events/sec` sustained for the MVP benchmark gate
@@ -125,7 +150,7 @@ The codebase implements the MVP pipeline, local platform wiring, JWT auth, tenan
 
 Current benchmark evidence shows the ingest path sustaining roughly `1.2k accepted eps` and the optimized processor sustaining roughly `876 processed eps` under the documented Compose benchmark profile. The repo now also has scale-aware evidence for processor replicas: under the current exact-count harness, a `3`-replica processor run processed `595.02 eps` versus `568.43 eps` for `1` replica, with better `p95`/`p99` latency and slightly lower peak lag. The next engineering gap is raising producer-side offered load so processor scaling can be measured under a harder sustained profile.
  
-Poison-message handling is now verified in an isolated drill artifact at `artifacts/failure-drills/dead-letter-verification-20260411-1509.json`: a malformed record written directly to Kafka was consumed by the processor, published to the DLQ topic, and surfaced through `dead_letter_total` in the overview API.
+Poison-message handling is now verified in the scripted drill artifact `artifacts/failure-drills/inject-poison-message-20260411-152328.json`: a malformed record written directly to `pulsestream.events` was consumed by a fresh-group processor, published to `pulsestream.events.dlq`, and surfaced through `dead_letter_total` in the overview API.
 
 ## Admin replay
 

@@ -5,6 +5,23 @@ on:
   pull_request:
 
 jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install contract tooling
+        run: npm ci
+
+      - name: Validate AsyncAPI contract
+        run: npm run contract:validate
+
   backend:
     runs-on: ubuntu-latest
     steps:

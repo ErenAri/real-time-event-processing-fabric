@@ -6,9 +6,8 @@ param(
     [string]$OverviewEndpoint = "http://localhost:8081/api/v1/metrics/overview",
     [string]$BearerToken = "",
     [switch]$PauseComposeSimulator = $true,
-    [int]$DrainTimeoutSeconds = 60,
-    [int]$MaxLagBeforeInject = 0,
-    [int]$TimeoutSeconds = 15,
+    [int]$ReadyTimeoutSeconds = 10,
+    [int]$TimeoutSeconds = 20,
     [string]$OutputPath = ""
 )
 
@@ -51,6 +50,12 @@ function ConvertTo-SingleQuotedShellLiteral {
     return $Value.Replace("'", "'""'""'")
 }
 
+function ConvertTo-Base64Utf8 {
+    param([string]$Value)
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Value))
+}
+
 function Stop-ComposeSimulator {
     param([string]$ComposeFilePath)
 
@@ -63,8 +68,120 @@ function Start-ComposeSimulator {
     docker compose -f $ComposeFilePath start producer-simulator | Out-Null
 }
 
+function Get-PrimaryProcessorContainerId {
+    param([string]$ComposeFilePath)
+
+    $containerIds = @(docker compose -f $ComposeFilePath ps -q stream-processor)
+    $containerIds = @($containerIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($containerIds.Count -eq 0) {
+        throw "stream-processor service is not running"
+    }
+
+    return $containerIds[0]
+}
+
+function Get-ContainerEnvMap {
+    param([string]$ContainerId)
+
+    $envMap = @{}
+    $inspection = docker inspect $ContainerId | ConvertFrom-Json
+    $lines = @($inspection[0].Config.Env)
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line) -or -not $line.Contains("=")) {
+            continue
+        }
+
+        $parts = $line.Split("=", 2)
+        $envMap[$parts[0]] = $parts[1]
+    }
+
+    return $envMap
+}
+
+function Get-ContainerNetworkName {
+    param([string]$ContainerId)
+
+    $inspection = docker inspect $ContainerId | ConvertFrom-Json
+    $networkNames = @($inspection[0].NetworkSettings.Networks.PSObject.Properties.Name)
+    if ($networkNames.Count -eq 0) {
+        return ""
+    }
+
+    return $networkNames[0]
+}
+
+function Start-DrillProcessor {
+    param(
+        [string]$ComposeFilePath,
+        [string]$TopicName,
+        [int]$ReadySeconds
+    )
+
+    $mainProcessor = Get-PrimaryProcessorContainerId -ComposeFilePath $ComposeFilePath
+    $envMap = Get-ContainerEnvMap -ContainerId $mainProcessor
+    $networkName = Get-ContainerNetworkName -ContainerId $mainProcessor
+    if ([string]::IsNullOrWhiteSpace($networkName)) {
+        throw "unable to resolve stream-processor network"
+    }
+
+    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddHHmmss")
+    $groupId = "pulsestream-dlq-drill-$timestamp"
+    $instanceId = "dlq-drill-$timestamp"
+    $containerName = "pulsestream-dlq-drill-$timestamp"
+
+    $dockerArgs = @(
+        "run",
+        "-d",
+        "--rm",
+        "--name", $containerName,
+        "--network", $networkName,
+        "-e", "POSTGRES_URL=$($envMap["POSTGRES_URL"])",
+        "-e", "POSTGRES_ADMIN_URL=$($envMap["POSTGRES_ADMIN_URL"])",
+        "-e", "KAFKA_BROKERS=$($envMap["KAFKA_BROKERS"])",
+        "-e", "KAFKA_TOPIC=$TopicName",
+        "-e", "KAFKA_DLQ_TOPIC=$($envMap["KAFKA_DLQ_TOPIC"])",
+        "-e", "KAFKA_GROUP_ID=$groupId",
+        "-e", "SERVICE_INSTANCE_ID=$instanceId",
+        "-e", "PROCESSOR_LISTEN_ADDR=:8082",
+        "docker-compose-stream-processor"
+    )
+
+    $containerId = (& docker @dockerArgs).Trim()
+    if ([string]::IsNullOrWhiteSpace($containerId)) {
+        throw "failed to start drill processor container"
+    }
+
+    $deadline = (Get-Date).AddSeconds($ReadySeconds)
+    do {
+        $status = (docker inspect -f "{{.State.Status}}" $containerName 2>$null).Trim()
+        if ($status -eq "running") {
+            Start-Sleep -Seconds 2
+            return [ordered]@{
+                container_name = $containerName
+                container_id = $containerId
+                group_id = $groupId
+                instance_id = $instanceId
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    throw "drill processor container did not become ready"
+}
+
+function Stop-DrillProcessor {
+    param([string]$ContainerName)
+
+    if ([string]::IsNullOrWhiteSpace($ContainerName)) {
+        return
+    }
+
+    docker rm -f $ContainerName | Out-Null
+}
+
 $headers = Get-AuthHeaders -Token $BearerToken
 $simulatorStopped = $false
+$drillProcessor = $null
 
 try {
     if ($PauseComposeSimulator) {
@@ -72,25 +189,14 @@ try {
         $simulatorStopped = $true
     }
 
-    $drainDeadline = (Get-Date).AddSeconds($DrainTimeoutSeconds)
-    do {
-        $before = Get-Overview -Url $OverviewEndpoint -Headers $headers
-        if ([int64]$before.consumer_lag -le [int64]$MaxLagBeforeInject) {
-            break
-        }
-        Start-Sleep -Seconds 1
-    } while ((Get-Date) -lt $drainDeadline)
-
-    if ([int64]$before.consumer_lag -gt [int64]$MaxLagBeforeInject) {
-        throw "consumer lag did not drain to $MaxLagBeforeInject within $DrainTimeoutSeconds seconds"
-    }
-
+    $before = Get-Overview -Url $OverviewEndpoint -Headers $headers
+    $drillProcessor = Start-DrillProcessor -ComposeFilePath $ComposeFile -TopicName $Topic -ReadySeconds $ReadyTimeoutSeconds
     $startedAt = Get-Date
 
-    $shellPayload = ConvertTo-SingleQuotedShellLiteral -Value $Payload
+    $payloadBase64 = ConvertTo-Base64Utf8 -Value $Payload
     $shellTopic = ConvertTo-SingleQuotedShellLiteral -Value $Topic
     $shellBootstrap = ConvertTo-SingleQuotedShellLiteral -Value $BootstrapServer
-    $publishCommand = "printf '%s\n' '$shellPayload' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server '$shellBootstrap' --topic '$shellTopic' >/dev/null"
+    $publishCommand = "printf '%s' '$payloadBase64' | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server '$shellBootstrap' --topic '$shellTopic' >/dev/null"
     docker compose -f $ComposeFile exec -T kafka sh -lc $publishCommand | Out-Null
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -115,6 +221,8 @@ try {
         topic = $Topic
         payload = $Payload
         paused_compose_simulator = [bool]$PauseComposeSimulator
+        drill_processor_group_id = $drillProcessor.group_id
+        drill_processor_instance_id = $drillProcessor.instance_id
         consumer_lag_before = [int64]$before.consumer_lag
         dead_letter_total_before = [int64]$before.dead_letter_total
         dead_letter_total_after = [int64]$after.dead_letter_total
@@ -133,6 +241,9 @@ try {
     Write-Host ($result | ConvertTo-Json -Depth 6)
 }
 finally {
+    if ($null -ne $drillProcessor) {
+        Stop-DrillProcessor -ContainerName $drillProcessor.container_name
+    }
     if ($simulatorStopped) {
         Start-ComposeSimulator -ComposeFilePath $ComposeFile
     }

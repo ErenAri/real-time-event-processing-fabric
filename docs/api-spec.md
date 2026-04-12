@@ -126,6 +126,14 @@ Each Go service exposes:
 - `GET /readyz`
 - `GET /metrics`
 
+## Async contract
+
+Kafka message contracts are documented separately from the HTTP APIs:
+
+- [asyncapi.yaml](/C:/Projects/real-time-event-processing-fabric/asyncapi.yaml) for topic addresses, operations, headers, and examples
+- [telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json) for the accepted telemetry payload
+- [dead-letter-record-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/dead-letter-record-v1.schema.json) for DLQ payloads
+
 ## Auth
 
 The local stack requires JWT bearer tokens for ingest and query endpoints.

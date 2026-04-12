@@ -35,10 +35,10 @@
 
 - Trigger: `./scripts/chaos/inject-poison-message.ps1` or write a malformed or semantically invalid record directly to Kafka
 - Expected behavior: processor publishes one DLQ record, commits the source offset only after the DLQ write succeeds, and increments `dead_letter_total`
-- Observed drill: `artifacts/failure-drills/dead-letter-verification-20260411-1509.json`
-- Observed behavior: a malformed record written to `pulsestream.verify.events` was logged as `message_dead_lettered`, published to `pulsestream.verify.events.dlq`, and moved the overview API from `dead_letter_total: 0` to `dead_letter_total: 1`
+- Observed drill: `artifacts/failure-drills/inject-poison-message-20260411-152328.json`
+- Observed behavior: the scripted drill paused the compose simulator, launched a temporary processor with a fresh consumer group at the current topic tail, wrote one malformed record directly to `pulsestream.events`, and moved the overview API from `dead_letter_total: 0` to `dead_letter_total: 1`
 - Observed behavior: the DLQ record captured the failure reason, source topic, source offset, consumer group, and base64-encoded original payload
-- Interpretation: processor-side poison messages are isolated without blocking the consumer loop, and the operator path can see the event through both the overview API and the DLQ topic
+- Interpretation: processor-side poison messages are isolated without blocking the consumer loop, and the operator path can see the event through both the overview API and the DLQ topic even when the main consumer group is already carrying backlog
 
 ## PostgreSQL pause or slowdown
 

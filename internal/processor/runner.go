@@ -34,6 +34,7 @@ type deadLetterPublisher interface {
 
 type RunnerConfig struct {
 	PartitionQueueCapacity int
+	Brokers                []string
 	ConsumerGroup          string
 }
 
@@ -255,13 +256,20 @@ func (r *Runner) handleMessage(ctx context.Context, message kafka.Message) error
 		return nil
 	}
 
+	ctx, span := telemetry.StartKafkaProcessSpan(ctx, message, r.config.ConsumerGroup, r.config.Brokers)
+	defer span.End()
+
 	event, reason, err := decode(message.Value)
 	if err != nil {
+		telemetry.SetKafkaMessageID(span, event.EventID)
+		telemetry.RecordSpanError(span, err)
 		if err := r.deadLetterMessage(ctx, message, event, reason, err); err != nil {
+			telemetry.RecordSpanError(span, err)
 			return err
 		}
 		return nil
 	}
+	telemetry.SetKafkaMessageID(span, event.EventID)
 
 	start := time.Now()
 	recorded, err := r.store.RecordProcessedEvent(ctx, event)
@@ -269,6 +277,7 @@ func (r *Runner) handleMessage(ctx context.Context, message kafka.Message) error
 		if ctx.Err() != nil {
 			return nil
 		}
+		telemetry.RecordSpanError(span, err)
 		return fmt.Errorf("record processed event: %w", err)
 	}
 
@@ -284,6 +293,7 @@ func (r *Runner) handleMessage(ctx context.Context, message kafka.Message) error
 	}
 
 	if err := r.commitMessage(ctx, message); err != nil {
+		telemetry.RecordSpanError(span, err)
 		return fmt.Errorf("commit message: %w", err)
 	}
 	return nil
@@ -338,6 +348,9 @@ func (r *Runner) deadLetterMessage(
 }
 
 func (r *Runner) commitMessage(ctx context.Context, message kafka.Message) error {
+	ctx, span := telemetry.StartKafkaCommitSpan(ctx, message, r.config.ConsumerGroup, r.config.Brokers)
+	defer span.End()
+
 	r.commitMu.Lock()
 	defer r.commitMu.Unlock()
 
@@ -345,6 +358,7 @@ func (r *Runner) commitMessage(ctx context.Context, message kafka.Message) error
 		if ctx.Err() != nil {
 			return nil
 		}
+		telemetry.RecordSpanError(span, err)
 		return err
 	}
 	return nil

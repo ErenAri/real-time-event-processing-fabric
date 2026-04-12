@@ -71,6 +71,7 @@ func run() error {
 
 	runner := processor.NewRunner(reader, storage, dlqPublisher, logger, registry, processor.RunnerConfig{
 		PartitionQueueCapacity: partitionQueueCapacity,
+		Brokers:                brokers,
 		ConsumerGroup:          groupID,
 	})
 	mux := http.NewServeMux()

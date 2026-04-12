@@ -27,6 +27,7 @@
 - `value` is numeric so aggregation and thresholding remain straightforward
 
 The formal JSON Schema for this contract lives at [schemas/telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json).
+The Kafka topic contract that references this schema lives at [asyncapi.yaml](/C:/Projects/real-time-event-processing-fabric/asyncapi.yaml).
 
 ## PostgreSQL tables
 
@@ -83,6 +84,8 @@ Stores processor-side poison messages that were already present in Kafka but cou
 - optional event metadata when it could be recovered
 - base64-encoded original payload
 - base64-encoded Kafka headers
+
+The formal JSON Schema for this payload lives at [schemas/dead-letter-record-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/dead-letter-record-v1.schema.json).
 
 ### `service_state`
 

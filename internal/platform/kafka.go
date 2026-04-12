@@ -10,6 +10,7 @@ import (
 
 	"pulsestream/internal/deadletter"
 	"pulsestream/internal/events"
+	"pulsestream/internal/telemetry"
 )
 
 type EventPublisher interface {
@@ -22,12 +23,21 @@ type DeadLetterPublisher interface {
 	Close() error
 }
 
+type kafkaMessageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
 type KafkaPublisher struct {
-	writer *kafka.Writer
+	writer  kafkaMessageWriter
+	topic   string
+	brokers []string
 }
 
 type KafkaDeadLetterPublisher struct {
-	writer *kafka.Writer
+	writer  kafkaMessageWriter
+	topic   string
+	brokers []string
 }
 
 type KafkaPublisherConfig struct {
@@ -37,17 +47,21 @@ type KafkaPublisherConfig struct {
 
 func NewKafkaPublisher(brokers []string, topic string, config KafkaPublisherConfig) *KafkaPublisher {
 	return &KafkaPublisher{
-		writer: newKafkaWriter(brokers, topic, config),
+		writer:  newKafkaWriter(brokers, topic, config),
+		topic:   topic,
+		brokers: append([]string(nil), brokers...),
 	}
 }
 
 func NewKafkaDeadLetterPublisher(brokers []string, topic string, config KafkaPublisherConfig) *KafkaDeadLetterPublisher {
 	return &KafkaDeadLetterPublisher{
-		writer: newKafkaWriter(brokers, topic, config),
+		writer:  newKafkaWriter(brokers, topic, config),
+		topic:   topic,
+		brokers: append([]string(nil), brokers...),
 	}
 }
 
-func newKafkaWriter(brokers []string, topic string, config KafkaPublisherConfig) *kafka.Writer {
+func newKafkaWriter(brokers []string, topic string, config KafkaPublisherConfig) kafkaMessageWriter {
 	if config.BatchTimeout <= 0 {
 		config.BatchTimeout = 5 * time.Millisecond
 	}
@@ -72,12 +86,17 @@ func (p *KafkaPublisher) PublishEvent(ctx context.Context, event events.Telemetr
 		return fmt.Errorf("marshal event: %w", err)
 	}
 
+	ctx, span := telemetry.StartKafkaProducerSpan(ctx, p.topic, []byte(event.PartitionKey()), len(payload), event.EventID, p.brokers)
+	defer span.End()
+
 	message := kafka.Message{
 		Key:   []byte(event.PartitionKey()),
 		Value: payload,
 		Time:  event.Timestamp,
 	}
+	telemetry.InjectKafkaHeaders(ctx, &message.Headers)
 	if err := p.writer.WriteMessages(ctx, message); err != nil {
+		telemetry.RecordSpanError(span, err)
 		return fmt.Errorf("publish to kafka: %w", err)
 	}
 	return nil
@@ -93,6 +112,9 @@ func (p *KafkaDeadLetterPublisher) PublishDeadLetter(ctx context.Context, record
 		return fmt.Errorf("marshal dead-letter record: %w", err)
 	}
 
+	ctx, span := telemetry.StartKafkaProducerSpan(ctx, p.topic, []byte(record.SourceKey), len(payload), record.EventID, p.brokers)
+	defer span.End()
+
 	message := kafka.Message{
 		Key:   []byte(record.SourceKey),
 		Value: payload,
@@ -101,7 +123,9 @@ func (p *KafkaDeadLetterPublisher) PublishDeadLetter(ctx context.Context, record
 			{Key: "dead-letter-reason", Value: []byte(record.Reason)},
 		},
 	}
+	telemetry.InjectKafkaHeaders(ctx, &message.Headers)
 	if err := p.writer.WriteMessages(ctx, message); err != nil {
+		telemetry.RecordSpanError(span, err)
 		return fmt.Errorf("publish dead-letter message: %w", err)
 	}
 	return nil

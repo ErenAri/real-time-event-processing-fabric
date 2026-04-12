@@ -24,7 +24,12 @@ func Configure(ctx context.Context, serviceName string, logger *slog.Logger) (fu
 		exporterName = "none"
 	}
 
-	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		),
+	)
 	if exporterName == "none" {
 		return func(context.Context) error { return nil }, nil
 	}

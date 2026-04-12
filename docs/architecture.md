@@ -15,6 +15,7 @@ PulseStream demonstrates a focused streaming architecture: high-volume event ing
 - `Kafka`: durable broker between write and processing paths, with a dedicated DLQ topic for processor-side poison messages
 - `dashboard`: React UI for throughput, lag, latency, and rejection visibility
 - `Prometheus` and `Grafana`: metrics collection and local operational visibility
+- `asyncapi.yaml` plus JSON Schemas: checked-in asynchronous contract for Kafka topics, headers, and payloads
 
 ## Data flow
 
@@ -39,6 +40,7 @@ Poison-message path:
 - Instance-aware processor state aggregation: each processor replica writes its own heartbeat row and the query layer aggregates live replicas instead of assuming a single process
 - Fail-closed poison-message handling: processor-side decode and validation failures are written to a DLQ topic before the source offset is committed
 - Immutable raw archive before broker publish: keeps a replayable event history even if downstream processing needs to be rebuilt
+- AsyncAPI plus JSON Schema contract governance: Kafka topics and payloads are versioned in source control and validated in CI
 - Docker Compose before Kubernetes: faster iteration and easier benchmark reproducibility on a single developer machine
 
 ## Hot views

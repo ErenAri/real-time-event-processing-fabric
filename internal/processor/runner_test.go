@@ -10,9 +10,14 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"pulsestream/internal/deadletter"
 	"pulsestream/internal/events"
+	"pulsestream/internal/telemetry"
 )
 
 type fakeReader struct {
@@ -77,6 +82,12 @@ func (s *blockingStore) RecordProcessedEvent(ctx context.Context, event events.T
 		close(s.startedFast)
 	}
 
+	return true, nil
+}
+
+type successfulStore struct{}
+
+func (s *successfulStore) RecordProcessedEvent(context.Context, events.TelemetryEvent) (bool, error) {
 	return true, nil
 }
 
@@ -260,5 +271,90 @@ func TestRunnerReturnsErrorWhenDeadLetterPublishFails(t *testing.T) {
 	defer reader.mu.Unlock()
 	if len(reader.committed) != 0 {
 		t.Fatalf("expected zero commits when dead-letter publish fails, got %d", len(reader.committed))
+	}
+}
+
+func TestRunnerCreatesProcessAndCommitSpansFromKafkaHeaders(t *testing.T) {
+	previousProvider := otel.GetTracerProvider()
+	previousPropagator := otel.GetTextMapPropagator()
+	recorder := tracetest.NewSpanRecorder()
+	provider := tracesdk.NewTracerProvider(tracesdk.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		),
+	)
+	defer func() {
+		otel.SetTracerProvider(previousProvider)
+		otel.SetTextMapPropagator(previousPropagator)
+		_ = provider.Shutdown(context.Background())
+	}()
+
+	reader := &fakeReader{}
+	store := &successfulStore{}
+	runner := NewRunner(reader, store, nil, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		Brokers:       []string{"kafka:9092"},
+		ConsumerGroup: "pulsestream-processor",
+	})
+
+	payload, err := events.EncodeTelemetryEvent(events.TelemetryEvent{
+		SchemaVersion: events.CurrentSchemaVersion,
+		EventID:       "evt-trace",
+		TenantID:      "tenant_01",
+		SourceID:      "sensor_01",
+		EventType:     "telemetry",
+		Timestamp:     time.Now().UTC(),
+		Value:         17.4,
+		Status:        events.StatusOK,
+		Region:        "eu-west",
+		Sequence:      1,
+	})
+	if err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+
+	ctx, parentSpan := otel.Tracer("test").Start(context.Background(), "send pulsestream.events")
+	message := kafka.Message{
+		Topic:     "pulsestream.events",
+		Partition: 1,
+		Offset:    42,
+		Key:       []byte("tenant_01:sensor_01"),
+		Value:     payload,
+	}
+	telemetry.InjectKafkaHeaders(ctx, &message.Headers)
+	parentSpan.End()
+
+	if err := runner.handleMessage(context.Background(), message); err != nil {
+		t.Fatalf("handle message: %v", err)
+	}
+
+	var processSpanName string
+	var processSpanID string
+	foundProcess := false
+	foundCommit := false
+	for _, span := range recorder.Ended() {
+		switch span.Name() {
+		case "process pulsestream.events":
+			foundProcess = true
+			processSpanName = span.Name()
+			processSpanID = span.SpanContext().SpanID().String()
+			if span.Parent().SpanID() != parentSpan.SpanContext().SpanID() {
+				t.Fatalf("process span parent mismatch: got %s want %s", span.Parent().SpanID(), parentSpan.SpanContext().SpanID())
+			}
+		case "commit pulsestream.events":
+			foundCommit = true
+			if processSpanID != "" && span.Parent().SpanID().String() != processSpanID {
+				t.Fatalf("commit span parent mismatch: got %s want %s", span.Parent().SpanID(), processSpanID)
+			}
+		}
+	}
+
+	if !foundProcess {
+		t.Fatalf("expected process span %q to be recorded", "process pulsestream.events")
+	}
+	if !foundCommit {
+		t.Fatalf("expected commit span to be recorded under %q", processSpanName)
 	}
 }

@@ -1,0 +1,170 @@
+asyncapi: 3.1.0
+info:
+  title: PulseStream Event Contract
+  version: 1.0.0
+  description: >-
+    Async contract for PulseStream Kafka topics. It documents the validated
+    telemetry event published by ingest-service and the dead-letter record
+    published by stream-processor when a Kafka message cannot be decoded or
+    validated.
+  contact:
+    name: PulseStream maintainers
+defaultContentType: application/json
+servers:
+  localHost:
+    host: localhost:9092
+    protocol: kafka
+    description: Kafka broker exposed on the host during local development.
+  dockerCompose:
+    host: kafka:9092
+    protocol: kafka
+    description: Kafka broker hostname inside the Docker Compose network.
+channels:
+  telemetryEvents:
+    address: pulsestream.events
+    description: Validated telemetry events archived by ingest-service and published to Kafka.
+    messages:
+      telemetryEvent:
+        $ref: '#/components/messages/TelemetryEvent'
+    bindings:
+      kafka:
+        bindingVersion: '0.5.0'
+        partitions: 3
+        replicas: 1
+  telemetryDeadLetters:
+    address: pulsestream.events.dlq
+    description: Processor-side poison messages written after decode or validation failure.
+    messages:
+      deadLetterRecord:
+        $ref: '#/components/messages/DeadLetterRecord'
+    bindings:
+      kafka:
+        bindingVersion: '0.5.0'
+        partitions: 3
+        replicas: 1
+operations:
+  publishTelemetry:
+    action: send
+    summary: Publish validated telemetry to Kafka.
+    description: >-
+      ingest-service archives accepted payloads and then publishes them to the
+      main Kafka topic with a partition key derived from tenant and source.
+    channel:
+      $ref: '#/channels/telemetryEvents'
+  consumeTelemetry:
+    action: receive
+    summary: Consume telemetry for aggregation and deduplication.
+    description: >-
+      stream-processor consumes telemetry events with the
+      pulsestream-processor consumer group, updates hot views, and commits the
+      source offset after processing or dead-lettering.
+    channel:
+      $ref: '#/channels/telemetryEvents'
+    bindings:
+      kafka:
+        bindingVersion: '0.5.0'
+        groupId:
+          type: string
+          enum:
+            - pulsestream-processor
+        clientId:
+          type: string
+          description: Service instance identifier for a stream-processor replica.
+  publishDeadLetter:
+    action: send
+    summary: Publish processor poison messages to the DLQ topic.
+    description: >-
+      stream-processor writes a dead-letter record when a message already in
+      Kafka cannot be decoded or fails validation.
+    channel:
+      $ref: '#/channels/telemetryDeadLetters'
+components:
+  messages:
+    TelemetryEvent:
+      name: TelemetryEvent
+      title: Telemetry event
+      summary: Validated telemetry payload accepted by ingest-service.
+      contentType: application/json
+      headers:
+        type: object
+        additionalProperties: false
+        properties:
+          traceparent:
+            type: string
+            description: W3C Trace Context header injected into Kafka headers.
+          tracestate:
+            type: string
+            description: Optional W3C trace state header.
+          baggage:
+            type: string
+            description: Optional W3C baggage header.
+      correlationId:
+        location: $message.header#/traceparent
+      bindings:
+        kafka:
+          bindingVersion: '0.5.0'
+          key:
+            type: string
+            description: Partition key in the form tenant_id:source_id.
+      payload:
+        schemaFormat: application/schema+json;version=draft-2020-12
+        schema:
+          $ref: './schemas/telemetry-event-v1.schema.json'
+      examples:
+        - headers:
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+          payload:
+            schema_version: 1
+            event_id: tenant_01-sensor_001-42
+            tenant_id: tenant_01
+            source_id: sensor_001
+            event_type: telemetry
+            timestamp: '2026-04-10T10:15:00Z'
+            value: 73.4
+            status: ok
+            region: eu-west
+            sequence: 42
+    DeadLetterRecord:
+      name: DeadLetterRecord
+      title: Dead-letter record
+      summary: Processor-side poison message emitted to the DLQ topic.
+      contentType: application/json
+      headers:
+        type: object
+        additionalProperties: false
+        properties:
+          dead-letter-reason:
+            type: string
+            description: Machine-readable failure reason duplicated from the payload.
+          traceparent:
+            type: string
+            description: W3C Trace Context header preserved from the source message.
+          tracestate:
+            type: string
+          baggage:
+            type: string
+      correlationId:
+        location: $message.header#/traceparent
+      bindings:
+        kafka:
+          bindingVersion: '0.5.0'
+          key:
+            type: string
+            description: Original source message key.
+      payload:
+        schemaFormat: application/schema+json;version=draft-2020-12
+        schema:
+          $ref: './schemas/dead-letter-record-v1.schema.json'
+      examples:
+        - headers:
+            dead-letter-reason: decode_failed
+          payload:
+            failed_at: '2026-04-11T15:23:28Z'
+            reason: decode_failed
+            error: decode event: invalid character 'n' looking for beginning of object key string
+            source_topic: pulsestream.events
+            source_partition: 1
+            source_offset: 821
+            source_key: tenant_01:sensor_001
+            consumer_group: pulsestream-processor
+            payload_base64: bm90LWpzb24=

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pulsestream.dev/schemas/dead-letter-record-v1.schema.json",
+  "title": "PulseStream Dead-Letter Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "failed_at",
+    "reason",
+    "error",
+    "source_topic",
+    "source_partition",
+    "source_offset",
+    "payload_base64"
+  ],
+  "properties": {
+    "failed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error": {
+      "type": "string"
+    },
+    "source_topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_partition": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_offset": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_key": {
+      "type": "string"
+    },
+    "consumer_group": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "source_id": {
+      "type": "string"
+    },
+    "payload_base64": {
+      "type": "string",
+      "contentEncoding": "base64"
+    },
+    "headers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "value_base64"],
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value_base64": {
+            "type": "string",
+            "contentEncoding": "base64"
+          }
+        }
+      }
+    }
+  }
+}

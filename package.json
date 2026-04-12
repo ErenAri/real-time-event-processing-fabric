@@ -1,0 +1,11 @@
+{
+  "name": "pulsestream-contracts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "contract:validate": "node ./scripts/validate-asyncapi.mjs"
+  },
+  "devDependencies": {
+    "@asyncapi/parser": "3.6.0"
+  }
+}
