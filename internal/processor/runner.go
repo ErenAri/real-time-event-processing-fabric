@@ -36,6 +36,7 @@ type RunnerConfig struct {
 	PartitionQueueCapacity int
 	Brokers                []string
 	ConsumerGroup          string
+	RetryBackoff           time.Duration
 }
 
 type Runner struct {
@@ -61,6 +62,8 @@ type Runner struct {
 	duplicateCounter      prometheus.Counter
 	deadLetterCounter     *prometheus.CounterVec
 	dlqPublishFailures    prometheus.Counter
+	fetchErrorCounter     prometheus.Counter
+	commitRetryCounter    prometheus.Counter
 	processDuration       prometheus.Histogram
 	consumerLagGauge      prometheus.Gauge
 	inFlightGauge         prometheus.Gauge
@@ -77,6 +80,9 @@ func NewRunner(
 ) *Runner {
 	if config.PartitionQueueCapacity <= 0 {
 		config.PartitionQueueCapacity = 256
+	}
+	if config.RetryBackoff <= 0 {
+		config.RetryBackoff = time.Second
 	}
 
 	runner := &Runner{
@@ -103,6 +109,14 @@ func NewRunner(
 			Name: "pulsestream_processor_dead_letter_publish_failures_total",
 			Help: "Number of dead-letter publish attempts that failed.",
 		}),
+		fetchErrorCounter: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pulsestream_processor_fetch_errors_total",
+			Help: "Number of Kafka fetch attempts that failed and were retried.",
+		}),
+		commitRetryCounter: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pulsestream_processor_commit_retries_total",
+			Help: "Number of Kafka commit attempts that failed and were retried.",
+		}),
 		processDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "pulsestream_processor_duration_seconds",
 			Help:    "Processing duration per event.",
@@ -127,6 +141,8 @@ func NewRunner(
 		runner.duplicateCounter,
 		runner.deadLetterCounter,
 		runner.dlqPublishFailures,
+		runner.fetchErrorCounter,
+		runner.commitRetryCounter,
 		runner.processDuration,
 		runner.consumerLagGauge,
 		runner.inFlightGauge,
@@ -185,8 +201,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			if ctx.Err() != nil || runCtx.Err() != nil {
 				break
 			}
-			fetchErr = fmt.Errorf("fetch kafka message: %w", err)
-			break
+			r.fetchErrorCounter.Inc()
+			r.logger.Warn("fetch_message_failed_retrying", "error", err, "backoff", r.config.RetryBackoff.String())
+			if !sleepWithContext(runCtx, r.config.RetryBackoff) {
+				break
+			}
+			continue
 		}
 
 		lag := r.reader.Stats().Lag
@@ -348,20 +368,37 @@ func (r *Runner) deadLetterMessage(
 }
 
 func (r *Runner) commitMessage(ctx context.Context, message kafka.Message) error {
-	ctx, span := telemetry.StartKafkaCommitSpan(ctx, message, r.config.ConsumerGroup, r.config.Brokers)
-	defer span.End()
+	for {
+		commitCtx, span := telemetry.StartKafkaCommitSpan(ctx, message, r.config.ConsumerGroup, r.config.Brokers)
 
-	r.commitMu.Lock()
-	defer r.commitMu.Unlock()
+		r.commitMu.Lock()
+		err := r.reader.CommitMessages(commitCtx, message)
+		r.commitMu.Unlock()
 
-	if err := r.reader.CommitMessages(ctx, message); err != nil {
-		if ctx.Err() != nil {
+		if err == nil {
+			span.End()
 			return nil
 		}
+		if ctx.Err() != nil {
+			span.End()
+			return nil
+		}
+
 		telemetry.RecordSpanError(span, err)
-		return err
+		span.End()
+		r.commitRetryCounter.Inc()
+		r.logger.Warn(
+			"commit_message_failed_retrying",
+			"error", err,
+			"topic", message.Topic,
+			"partition", message.Partition,
+			"offset", message.Offset,
+			"backoff", r.config.RetryBackoff.String(),
+		)
+		if !sleepWithContext(ctx, r.config.RetryBackoff) {
+			return nil
+		}
 	}
-	return nil
 }
 
 func (r *Runner) addInFlight(delta int64) {
@@ -391,4 +428,16 @@ func decode(payload []byte) (events.TelemetryEvent, string, error) {
 	}
 
 	return partial, "decode_failed", err
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

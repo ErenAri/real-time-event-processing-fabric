@@ -46,7 +46,27 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	retryBackoff, err := platform.EnvDuration("PROCESSOR_RETRY_BACKOFF", time.Second)
+	if err != nil {
+		return err
+	}
 	snapshotInterval, err := platform.EnvDuration("PROCESSOR_SNAPSHOT_INTERVAL", 5*time.Second)
+	if err != nil {
+		return err
+	}
+	kafkaReadTimeout, err := platform.EnvDuration("KAFKA_READ_TIMEOUT", 2*time.Second)
+	if err != nil {
+		return err
+	}
+	kafkaWriteTimeout, err := platform.EnvDuration("KAFKA_WRITE_TIMEOUT", 2*time.Second)
+	if err != nil {
+		return err
+	}
+	kafkaWriteMaxAttempts, err := platform.EnvInt("KAFKA_WRITE_MAX_ATTEMPTS", 2)
+	if err != nil {
+		return err
+	}
+	kafkaConnectionConfig, err := platform.LoadKafkaConnectionConfigFromEnv()
 	if err != nil {
 		return err
 	}
@@ -57,12 +77,22 @@ func run() error {
 	}
 	defer storage.Close()
 
-	reader := platform.NewKafkaReader(brokers, topic, groupID)
+	reader, err := platform.NewKafkaReader(brokers, topic, groupID, kafkaConnectionConfig)
+	if err != nil {
+		return err
+	}
 	defer reader.Close()
 
 	var dlqPublisher platform.DeadLetterPublisher
 	if dlqTopic != "" {
-		dlqPublisher = platform.NewKafkaDeadLetterPublisher(brokers, dlqTopic, platform.KafkaPublisherConfig{})
+		dlqPublisher, err = platform.NewKafkaDeadLetterPublisher(brokers, dlqTopic, platform.KafkaPublisherConfig{
+			ReadTimeout:  kafkaReadTimeout,
+			WriteTimeout: kafkaWriteTimeout,
+			MaxAttempts:  kafkaWriteMaxAttempts,
+		}, kafkaConnectionConfig)
+		if err != nil {
+			return err
+		}
 		defer dlqPublisher.Close()
 	}
 
@@ -73,6 +103,7 @@ func run() error {
 		PartitionQueueCapacity: partitionQueueCapacity,
 		Brokers:                brokers,
 		ConsumerGroup:          groupID,
+		RetryBackoff:           retryBackoff,
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
@@ -121,9 +152,12 @@ func run() error {
 		"listen_addr", listenAddr,
 		"kafka_topic", topic,
 		"kafka_dlq_topic", dlqTopic,
+		"kafka_security_protocol", kafkaConnectionConfig.SecurityProtocol,
+		"kafka_sasl_mechanism", kafkaConnectionConfig.SASLMechanism,
 		"group_id", groupID,
 		"instance_id", instanceID,
 		"partition_queue_capacity", partitionQueueCapacity,
+		"retry_backoff", retryBackoff.String(),
 	)
 	select {
 	case <-ctx.Done():

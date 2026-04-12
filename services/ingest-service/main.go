@@ -42,7 +42,16 @@ func run() error {
 	topic := platform.EnvString("KAFKA_TOPIC", "pulsestream.events")
 	postgresURL := platform.EnvString("POSTGRES_URL", "postgres://postgres:postgres@localhost:5432/pulsestream?sslmode=disable")
 	postgresAdminURL := platform.EnvString("POSTGRES_ADMIN_URL", "")
+	rawArchiveBackend := platform.EnvString("RAW_ARCHIVE_BACKEND", eventarchive.BackendFilesystem)
 	rawArchiveDir := platform.EnvString("RAW_ARCHIVE_DIR", "data/raw-archive")
+	rawArchiveFlushInterval, err := platform.EnvDuration("RAW_ARCHIVE_FLUSH_INTERVAL", 5*time.Second)
+	if err != nil {
+		return err
+	}
+	rawArchiveFlushBytes, err := platform.EnvInt("RAW_ARCHIVE_FLUSH_BYTES", 256*1024)
+	if err != nil {
+		return err
+	}
 	adminToken := platform.EnvString("ADMIN_TOKEN", "pulsestream-dev-admin")
 	jwtSecret := platform.EnvString("AUTH_JWT_SECRET", "")
 	jwtIssuer := platform.EnvString("AUTH_JWT_ISSUER", "")
@@ -56,7 +65,27 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	kafkaReadTimeout, err := platform.EnvDuration("KAFKA_READ_TIMEOUT", 2*time.Second)
+	if err != nil {
+		return err
+	}
+	kafkaWriteTimeout, err := platform.EnvDuration("KAFKA_WRITE_TIMEOUT", 2*time.Second)
+	if err != nil {
+		return err
+	}
+	kafkaWriteMaxAttempts, err := platform.EnvInt("KAFKA_WRITE_MAX_ATTEMPTS", 2)
+	if err != nil {
+		return err
+	}
+	kafkaConnectionConfig, err := platform.LoadKafkaConnectionConfigFromEnv()
+	if err != nil {
+		return err
+	}
 	snapshotInterval, err := platform.EnvDuration("INGEST_SNAPSHOT_INTERVAL", 5*time.Second)
+	if err != nil {
+		return err
+	}
+	maxInFlight, err := platform.EnvInt("INGEST_MAX_INFLIGHT", 256)
 	if err != nil {
 		return err
 	}
@@ -75,18 +104,39 @@ func run() error {
 		}
 	}
 
-	publisher := platform.NewKafkaPublisher(brokers, topic, platform.KafkaPublisherConfig{
+	publisher, err := platform.NewKafkaPublisher(brokers, topic, platform.KafkaPublisherConfig{
 		BatchTimeout: kafkaBatchTimeout,
 		BatchSize:    kafkaBatchSize,
-	})
+		ReadTimeout:  kafkaReadTimeout,
+		WriteTimeout: kafkaWriteTimeout,
+		MaxAttempts:  kafkaWriteMaxAttempts,
+	}, kafkaConnectionConfig)
+	if err != nil {
+		return err
+	}
 	defer publisher.Close()
-	archiver := eventarchive.NewFileArchive(rawArchiveDir)
+	archiver, err := eventarchive.New(ctx, eventarchive.Config{
+		Backend:  rawArchiveBackend,
+		FileRoot: rawArchiveDir,
+		AzureBlob: eventarchive.AzureBlobConfig{
+			AccountURL:       platform.EnvString("RAW_ARCHIVE_AZURE_BLOB_ACCOUNT_URL", ""),
+			ConnectionString: platform.EnvString("RAW_ARCHIVE_AZURE_BLOB_CONNECTION_STRING", ""),
+			Container:        platform.EnvString("RAW_ARCHIVE_AZURE_BLOB_CONTAINER", ""),
+			Prefix:           platform.EnvString("RAW_ARCHIVE_AZURE_BLOB_PREFIX", "raw-archive"),
+			FlushInterval:    rawArchiveFlushInterval,
+			FlushBytes:       rawArchiveFlushBytes,
+		},
+	})
+	if err != nil {
+		return err
+	}
 	defer archiver.Close()
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 
 	handler := api.NewIngestHandler(logger, publisher, storage, archiver, archiver, verifier, adminToken, registry)
+	handler.SetMaxInFlight(maxInFlight)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -124,9 +174,16 @@ func run() error {
 		"listen_addr", listenAddr,
 		"kafka_topic", topic,
 		"kafka_brokers", fmt.Sprintf("%v", brokers),
+		"kafka_security_protocol", kafkaConnectionConfig.SecurityProtocol,
+		"kafka_sasl_mechanism", kafkaConnectionConfig.SASLMechanism,
 		"kafka_batch_timeout", kafkaBatchTimeout.String(),
 		"kafka_batch_size", kafkaBatchSize,
+		"kafka_read_timeout", kafkaReadTimeout.String(),
+		"kafka_write_timeout", kafkaWriteTimeout.String(),
+		"kafka_write_max_attempts", kafkaWriteMaxAttempts,
+		"raw_archive_backend", rawArchiveBackend,
 		"raw_archive_dir", rawArchiveDir,
+		"max_inflight", maxInFlight,
 		"instance_id", instanceID,
 	)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

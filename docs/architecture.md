@@ -34,6 +34,7 @@ Poison-message path:
 ## Design decisions
 
 - Kafka over a cloud-managed broker first: stronger local reproducibility and better control over failure testing
+- Event Hubs compatibility through the Kafka protocol: the same Go services can target Azure by switching Kafka transport settings to `SASL_SSL` and `PLAIN`
 - PostgreSQL as the only hot store in MVP: simpler than Redis plus Postgres while still supporting aggregate reads cleanly
 - Idempotent at-least-once processing: `processed_events.event_id` acts as the duplicate guard without the complexity of exactly-once semantics
 - Partition-parallel processing in one processor instance: keeps ordering within a partition but allows different Kafka partitions to make progress concurrently
@@ -70,3 +71,16 @@ Processor snapshots currently include:
 ## Replay path
 
 `admin client -> ingest-service replay endpoint -> raw archive scan -> Kafka -> stream-processor -> PostgreSQL`
+
+## Azure deployment path
+
+The first Azure deployment variant uses:
+
+- Azure Event Hubs as the Kafka endpoint
+- Azure Blob Storage for raw archive durability and replay scanning
+- Azure Container Apps for `ingest-service`, `query-service`, and `stream-processor`
+- Azure Log Analytics through the Container Apps environment
+- system-assigned managed identity on `ingest-service` for Blob access
+- existing PostgreSQL and Event Hubs credentials injected as Container Apps secrets
+
+This path now provides a durable Azure replay archive. The main remaining Azure gaps are dashboard deployment parity, infrastructure provisioning for the backing services, and published Azure benchmark evidence.

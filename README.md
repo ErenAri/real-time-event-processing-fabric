@@ -31,6 +31,7 @@ internal/
 web/dashboard/
 schemas/
 deploy/docker-compose/
+deploy/azure/container-apps/
 docs/
 scripts/
 asyncapi.yaml
@@ -137,20 +138,29 @@ graph TD
 - [dead-letter-record-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/dead-letter-record-v1.schema.json) defines the processor-side poison-message payload
 - GitHub Actions validates the AsyncAPI document on every push and pull request
 
+## Azure variant
+
+- The Kafka client layer now supports local `PLAINTEXT` Kafka and Azure Event Hubs via `SASL_SSL` plus `PLAIN` credentials from environment variables
+- Azure Container Apps deployment scaffolding for the backend services lives under [deploy/azure/container-apps](/C:/Projects/real-time-event-processing-fabric/deploy/azure/container-apps)
+- The ingest service now supports a Blob-backed raw archive for durable Azure replay, using managed identity by default
+- The deployment template assumes existing Event Hubs, Blob Storage, and PostgreSQL dependencies and focuses on application hosting first
+
 ## Evidence goals
 
 - Throughput target: `5k events/sec` sustained for the MVP benchmark gate
 - Dashboard freshness target: under `2s`
-- Failure proofs: processor restart, duplicate handling, malformed burst handling, PostgreSQL slowdown drill
+- Failure proofs: processor restart, duplicate handling, malformed burst handling, broker outage handling, PostgreSQL slowdown drill
 - Docs and runbooks: see the files under [`docs/`](docs)
 
 ## Status
 
-The codebase implements the MVP pipeline, local platform wiring, JWT auth, tenant-scoped authorization, PostgreSQL row-level security, and poison-message dead-lettering. Replay jobs, Redis caching, and cloud deployment remain follow-on work.
+The codebase implements the MVP pipeline, local platform wiring, JWT auth, tenant-scoped authorization, PostgreSQL row-level security, poison-message dead-lettering, Kafka trace propagation, contract validation, an Event Hubs-compatible Kafka transport layer, a Blob-backed Azure hosting path, processor-side Kafka retry handling, and an explicit ingest in-flight backpressure gate. Redis caching, Azure dashboard deployment, and Azure benchmark evidence remain follow-on work.
 
 Current benchmark evidence shows the ingest path sustaining roughly `1.2k accepted eps` and the optimized processor sustaining roughly `876 processed eps` under the documented Compose benchmark profile. The repo now also has scale-aware evidence for processor replicas: under the current exact-count harness, a `3`-replica processor run processed `595.02 eps` versus `568.43 eps` for `1` replica, with better `p95`/`p99` latency and slightly lower peak lag. The next engineering gap is raising producer-side offered load so processor scaling can be measured under a harder sustained profile.
  
 Poison-message handling is now verified in the scripted drill artifact `artifacts/failure-drills/inject-poison-message-20260411-152328.json`: a malformed record written directly to `pulsestream.events` was consumed by a fresh-group processor, published to `pulsestream.events.dlq`, and surfaced through `dead_letter_total` in the overview API.
+
+Broker-outage handling is now materially stronger in the verified artifact `artifacts/failure-drills/broker-outage-20260412-200340.json`: with an `800 eps` target load and a `12s` Kafka outage, the processor stayed alive and retried fetches instead of crashing, ingest recorded `5,767` explicit `publish_failed` rejections, the raw archive delta remained nearly balanced with the accepted-plus-rejected totals, and recovery returned within the drill window. A follow-up rerun after the ingest backpressure change exposed a timeout in the drill's Kafka-health wait rather than a new application fault, so the current published outage evidence remains the `20260412-200340` artifact.
 
 ## Admin replay
 

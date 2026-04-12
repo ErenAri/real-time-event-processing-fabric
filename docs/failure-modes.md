@@ -48,9 +48,16 @@
 
 ## Broker outage
 
-- Trigger: stop or restart the Kafka container manually
-- Expected behavior: ingest publish failures become visible, accepted traffic drops, raw archive still retains valid requests, and recovery resumes when broker health returns
-- Evidence to capture: ingest rejection reasons tagged as `publish_failed`
+- Trigger: `./scripts/chaos/broker-outage.ps1`
+- Expected behavior: ingest publish failures become visible quickly, accepted traffic drops during the outage window, the raw archive still retains valid requests, and the processor resumes consumption after broker health returns without crashing the service
+- Observed drill before processor retry hardening: `artifacts/failure-drills/broker-outage-20260412-195145.json`
+- Observed behavior before hardening: with an `800 eps` target load and a `12s` Kafka outage, the archive delta was `11,720`, accepted traffic increased by `8,722`, explicit `publish_failed` rejections increased by `2,000`, and the accounting gap remained `998`
+- Observed behavior before hardening: the producer log showed large numbers of HTTP client timeouts and the processor log showed a fatal `fetch kafka message` panic when the broker connection was refused
+- Observed drill after processor retry hardening: `artifacts/failure-drills/broker-outage-20260412-200340.json`
+- Observed behavior after hardening: the archive delta increased by `26,160`, accepted traffic increased by `20,391`, explicit `publish_failed` rejections increased by `5,767`, and the accounting gap dropped to `2`
+- Observed behavior after hardening: the processor stayed live and emitted `fetch_message_failed_retrying` warnings instead of exiting, accepted traffic recovered within the drill window, and `p95` / `p99` processing latency peaked at `47ms` / `143ms`
+- Interpretation: broker outage handling is now materially stronger because the consumer no longer crashes on broker loss and the ingest path surfaces nearly all failed publishes explicitly; the remaining gap is tightening overload behavior at the ingest edge so client timeouts disappear under sustained broker loss
+- Current code now includes an explicit ingest in-flight backpressure gate, but the first rerun after that change hit a timeout in the drill's Kafka-health wait and did not produce a publishable artifact
 
 ## Replay and rebuild
 

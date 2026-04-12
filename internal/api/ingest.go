@@ -49,6 +49,9 @@ type IngestHandler struct {
 
 	acceptedTotal atomic.Int64
 	rejectedTotal atomic.Int64
+	inFlightTotal atomic.Int64
+
+	inFlightLimit chan struct{}
 
 	requestDuration  prometheus.Histogram
 	publishDuration  prometheus.Histogram
@@ -57,6 +60,7 @@ type IngestHandler struct {
 	archivedCounter  prometheus.Counter
 	replayCounter    prometheus.Counter
 	rejectedCounters *prometheus.CounterVec
+	inFlightGauge    prometheus.Gauge
 }
 
 func NewIngestHandler(
@@ -105,6 +109,10 @@ func NewIngestHandler(
 			Name: "pulsestream_ingest_replayed_total",
 			Help: "Number of archived events replayed through the admin endpoint.",
 		}),
+		inFlightGauge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pulsestream_ingest_inflight_requests",
+			Help: "Number of ingest requests currently in archive/publish processing.",
+		}),
 		rejectedCounters: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pulsestream_ingest_rejected_total",
 			Help: "Number of rejected events by reason.",
@@ -118,10 +126,19 @@ func NewIngestHandler(
 		handler.acceptedCounter,
 		handler.archivedCounter,
 		handler.replayCounter,
+		handler.inFlightGauge,
 		handler.rejectedCounters,
 	)
 
 	return handler
+}
+
+func (h *IngestHandler) SetMaxInFlight(limit int) {
+	if limit <= 0 {
+		h.inFlightLimit = nil
+		return
+	}
+	h.inFlightLimit = make(chan struct{}, limit)
 }
 
 func (h *IngestHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -175,6 +192,12 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := auth.ContextWithPrincipal(r.Context(), principal)
+	if !h.tryAcquireInFlight() {
+		h.reject(ctx, body, event.TenantID, event.SourceID, "backpressure")
+		platform.WriteError(w, http.StatusServiceUnavailable, "ingest service is overloaded")
+		return
+	}
+	defer h.releaseInFlight()
 
 	if h.archiver != nil {
 		archiveStart := time.Now()
@@ -363,4 +386,34 @@ func (h *IngestHandler) authorizeAdminToken(r *http.Request) bool {
 	}
 
 	return subtle.ConstantTimeCompare([]byte(token), []byte(h.adminToken)) == 1
+}
+
+func (h *IngestHandler) tryAcquireInFlight() bool {
+	if h.inFlightLimit != nil {
+		select {
+		case h.inFlightLimit <- struct{}{}:
+		default:
+			return false
+		}
+	}
+
+	total := h.inFlightTotal.Add(1)
+	h.inFlightGauge.Set(float64(total))
+	return true
+}
+
+func (h *IngestHandler) releaseInFlight() {
+	if h.inFlightLimit != nil {
+		select {
+		case <-h.inFlightLimit:
+		default:
+		}
+	}
+
+	total := h.inFlightTotal.Add(-1)
+	if total < 0 {
+		total = 0
+		h.inFlightTotal.Store(0)
+	}
+	h.inFlightGauge.Set(float64(total))
 }

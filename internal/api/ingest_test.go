@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,28 @@ func (f *fakePublisher) PublishEvent(_ context.Context, event events.TelemetryEv
 }
 
 func (f *fakePublisher) Close() error {
+	return nil
+}
+
+type blockingPublisher struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingPublisher) PublishEvent(ctx context.Context, event events.TelemetryEvent) error {
+	f.once.Do(func() {
+		close(f.started)
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-f.release:
+		return nil
+	}
+}
+
+func (f *blockingPublisher) Close() error {
 	return nil
 }
 
@@ -279,5 +302,76 @@ func TestIngestHandlerReplaysArchivedEventsForAdminJWT(t *testing.T) {
 	}
 	if len(publisher.published) != 1 {
 		t.Fatalf("expected one replayed publish, got %d", len(publisher.published))
+	}
+}
+
+func TestIngestHandlerRejectsWhenBackpressureLimitIsReached(t *testing.T) {
+	publisher := &blockingPublisher{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	recorder := &fakeRejections{}
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, nil, nil, nil, "", prometheus.NewRegistry())
+	handler.SetMaxInFlight(1)
+
+	firstRequest := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(`{
+		"schema_version":1,
+		"event_id":"evt-1",
+		"tenant_id":"tenant_1",
+		"source_id":"sensor_1",
+		"event_type":"telemetry",
+		"timestamp":"2026-04-10T12:00:00Z",
+		"value":91.2,
+		"status":"ok",
+		"region":"eu-west",
+		"sequence":1
+	}`))
+	firstRecorder := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.handleEvents(firstRecorder, firstRequest)
+		close(done)
+	}()
+
+	select {
+	case <-publisher.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not occupy the in-flight slot")
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(`{
+		"schema_version":1,
+		"event_id":"evt-2",
+		"tenant_id":"tenant_1",
+		"source_id":"sensor_2",
+		"event_type":"telemetry",
+		"timestamp":"2026-04-10T12:00:00Z",
+		"value":91.2,
+		"status":"ok",
+		"region":"eu-west",
+		"sequence":2
+	}`))
+	secondRecorder := httptest.NewRecorder()
+	handler.handleEvents(secondRecorder, secondRequest)
+
+	if secondRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", secondRecorder.Code)
+	}
+	if len(recorder.records) != 1 {
+		t.Fatalf("expected one rejection record, got %d", len(recorder.records))
+	}
+	if recorder.records[0].Reason != "backpressure" {
+		t.Fatalf("expected backpressure rejection, got %q", recorder.records[0].Reason)
+	}
+
+	close(publisher.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not complete")
+	}
+	if firstRecorder.Code != http.StatusAccepted {
+		t.Fatalf("expected first request to succeed, got %d", firstRecorder.Code)
 	}
 }

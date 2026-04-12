@@ -41,43 +41,39 @@ type KafkaDeadLetterPublisher struct {
 }
 
 type KafkaPublisherConfig struct {
-	BatchTimeout time.Duration
-	BatchSize    int
+	BatchTimeout    time.Duration
+	BatchSize       int
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	MaxAttempts     int
+	WriteBackoffMin time.Duration
+	WriteBackoffMax time.Duration
 }
 
-func NewKafkaPublisher(brokers []string, topic string, config KafkaPublisherConfig) *KafkaPublisher {
+func NewKafkaPublisher(brokers []string, topic string, config KafkaPublisherConfig, connectionConfig KafkaConnectionConfig) (*KafkaPublisher, error) {
+	writer, err := connectionConfig.newWriter(brokers, topic, config)
+	if err != nil {
+		return nil, err
+	}
+
 	return &KafkaPublisher{
-		writer:  newKafkaWriter(brokers, topic, config),
+		writer:  writer,
 		topic:   topic,
 		brokers: append([]string(nil), brokers...),
-	}
+	}, nil
 }
 
-func NewKafkaDeadLetterPublisher(brokers []string, topic string, config KafkaPublisherConfig) *KafkaDeadLetterPublisher {
+func NewKafkaDeadLetterPublisher(brokers []string, topic string, config KafkaPublisherConfig, connectionConfig KafkaConnectionConfig) (*KafkaDeadLetterPublisher, error) {
+	writer, err := connectionConfig.newWriter(brokers, topic, config)
+	if err != nil {
+		return nil, err
+	}
+
 	return &KafkaDeadLetterPublisher{
-		writer:  newKafkaWriter(brokers, topic, config),
+		writer:  writer,
 		topic:   topic,
 		brokers: append([]string(nil), brokers...),
-	}
-}
-
-func newKafkaWriter(brokers []string, topic string, config KafkaPublisherConfig) kafkaMessageWriter {
-	if config.BatchTimeout <= 0 {
-		config.BatchTimeout = 5 * time.Millisecond
-	}
-	if config.BatchSize <= 0 {
-		config.BatchSize = 256
-	}
-
-	return &kafka.Writer{
-		Addr:                   kafka.TCP(brokers...),
-		Topic:                  topic,
-		RequiredAcks:           kafka.RequireOne,
-		BatchTimeout:           config.BatchTimeout,
-		BatchSize:              config.BatchSize,
-		AllowAutoTopicCreation: true,
-		Balancer:               &kafka.Hash{},
-	}
+	}, nil
 }
 
 func (p *KafkaPublisher) PublishEvent(ctx context.Context, event events.TelemetryEvent) error {
@@ -135,15 +131,6 @@ func (p *KafkaDeadLetterPublisher) Close() error {
 	return p.writer.Close()
 }
 
-func NewKafkaReader(brokers []string, topic string, groupID string) *kafka.Reader {
-	return kafka.NewReader(kafka.ReaderConfig{
-		Brokers:        brokers,
-		GroupID:        groupID,
-		Topic:          topic,
-		MinBytes:       1,
-		MaxBytes:       10e6,
-		MaxWait:        500 * time.Millisecond,
-		CommitInterval: time.Second,
-		StartOffset:    kafka.LastOffset,
-	})
+func NewKafkaReader(brokers []string, topic string, groupID string, connectionConfig KafkaConnectionConfig) (*kafka.Reader, error) {
+	return connectionConfig.NewReader(topic, groupID, brokers)
 }

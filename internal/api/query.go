@@ -93,6 +93,7 @@ func (h *QueryHandler) handleOverview(w http.ResponseWriter, r *http.Request) {
 		platform.WriteError(w, http.StatusInternalServerError, "failed to load overview")
 		return
 	}
+	overview.RecentRejections = ensureRecentRejections(overview.RecentRejections)
 	platform.WriteJSON(w, http.StatusOK, overview)
 }
 
@@ -131,7 +132,7 @@ func (h *QueryHandler) handleTenantSeries(w http.ResponseWriter, r *http.Request
 	platform.WriteJSON(w, http.StatusOK, map[string]any{
 		"tenant_id": tenantID,
 		"window":    window.String(),
-		"series":    series,
+		"series":    ensureTenantSeries(series),
 	})
 }
 
@@ -169,7 +170,7 @@ func (h *QueryHandler) handleTopSources(w http.ResponseWriter, r *http.Request) 
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{
 		"tenant_id": tenantID,
-		"sources":   sources,
+		"sources":   ensureTopSources(sources),
 	})
 }
 
@@ -195,7 +196,7 @@ func (h *QueryHandler) handleRejections(w http.ResponseWriter, r *http.Request) 
 		platform.WriteError(w, http.StatusInternalServerError, "failed to load recent rejections")
 		return
 	}
-	platform.WriteJSON(w, http.StatusOK, map[string]any{"rejections": rejections})
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"rejections": ensureRecentRejections(rejections)})
 }
 
 func (h *QueryHandler) authenticateRequest(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
@@ -209,4 +210,25 @@ func (h *QueryHandler) authenticateRequest(w http.ResponseWriter, r *http.Reques
 		return auth.Principal{}, false
 	}
 	return principal, true
+}
+
+func ensureTenantSeries(series []store.TenantBucket) []store.TenantBucket {
+	if series == nil {
+		return []store.TenantBucket{}
+	}
+	return series
+}
+
+func ensureTopSources(sources []store.SourceMetric) []store.SourceMetric {
+	if sources == nil {
+		return []store.SourceMetric{}
+	}
+	return sources
+}
+
+func ensureRecentRejections(rejections []store.RecentRejection) []store.RecentRejection {
+	if rejections == nil {
+		return []store.RecentRejection{}
+	}
+	return rejections
 }

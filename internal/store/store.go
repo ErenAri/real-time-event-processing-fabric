@@ -321,7 +321,7 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 			GeneratedAt:      time.Now().UTC(),
 			ProcessedTotal:   processedTotal,
 			EventsPerSecond:  float64(processedLastMinute) / 60.0,
-			RecentRejections: rejections,
+			RecentRejections: ensureRecentRejectionsSlice(rejections),
 		}
 		if processedLastMinute > 0 {
 			overview.ErrorRate = float64(errorLastMinute) / float64(processedLastMinute)
@@ -390,6 +390,9 @@ func (s *Store) GetTenantSeries(ctx context.Context, tenantID string, window tim
 	if err != nil {
 		return nil, err
 	}
+	if buckets == nil {
+		return []TenantBucket{}, nil
+	}
 	return buckets, nil
 }
 
@@ -430,6 +433,9 @@ func (s *Store) GetTopSources(ctx context.Context, tenantID string, limit int) (
 	if err != nil {
 		return nil, err
 	}
+	if sources == nil {
+		return []SourceMetric{}, nil
+	}
 	return sources, nil
 }
 
@@ -442,6 +448,9 @@ func (s *Store) RecentRejections(ctx context.Context, limit int) ([]RecentReject
 	})
 	if err != nil {
 		return nil, err
+	}
+	if rejections == nil {
+		return []RecentRejection{}, nil
 	}
 	return rejections, nil
 }
@@ -573,6 +582,13 @@ func statusCounts(status events.Status) (int64, int64, int64) {
 	default:
 		return 0, 0, 1
 	}
+}
+
+func ensureRecentRejectionsSlice(rejections []RecentRejection) []RecentRejection {
+	if rejections == nil {
+		return []RecentRejection{}
+	}
+	return rejections
 }
 
 func formatInterval(value time.Duration) string {

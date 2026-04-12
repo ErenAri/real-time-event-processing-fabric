@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +100,111 @@ func TestKafkaDeadLetterPublisherInjectsTraceContextHeaders(t *testing.T) {
 	}
 	if findHeaderValue(writer.messages[0].Headers, "dead-letter-reason") != "decode_failed" {
 		t.Fatalf("expected dead-letter-reason header, got %q", findHeaderValue(writer.messages[0].Headers, "dead-letter-reason"))
+	}
+}
+
+func TestLoadKafkaConnectionConfigDefaultsToPlaintext(t *testing.T) {
+	config, err := LoadKafkaConnectionConfigFromEnv()
+	if err != nil {
+		t.Fatalf("load kafka config: %v", err)
+	}
+
+	if config.SecurityProtocol != KafkaSecurityProtocolPlaintext {
+		t.Fatalf("expected plaintext security protocol, got %q", config.SecurityProtocol)
+	}
+	if !config.AllowAutoTopicCreation {
+		t.Fatal("expected auto topic creation to default to true")
+	}
+
+	reader, err := config.NewReader("pulsestream.events", "group-a", []string{"localhost:9092"})
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	defer reader.Close()
+}
+
+func TestLoadKafkaConnectionConfigSupportsEventHubsSASLSSL(t *testing.T) {
+	t.Setenv("KAFKA_SECURITY_PROTOCOL", KafkaSecurityProtocolSASLSSL)
+	t.Setenv("KAFKA_SASL_MECHANISM", KafkaSASLMechanismPlain)
+	t.Setenv("KAFKA_SASL_USERNAME", "$ConnectionString")
+	t.Setenv("KAFKA_SASL_PASSWORD", "Endpoint=sb://namespace.servicebus.windows.net/;SharedAccessKeyName=policy;SharedAccessKey=secret")
+	t.Setenv("KAFKA_TLS_SERVER_NAME", "namespace.servicebus.windows.net")
+	t.Setenv("KAFKA_ALLOW_AUTO_TOPIC_CREATION", "false")
+
+	config, err := LoadKafkaConnectionConfigFromEnv()
+	if err != nil {
+		t.Fatalf("load kafka config: %v", err)
+	}
+
+	if config.SecurityProtocol != KafkaSecurityProtocolSASLSSL {
+		t.Fatalf("expected SASL_SSL security protocol, got %q", config.SecurityProtocol)
+	}
+	if config.AllowAutoTopicCreation {
+		t.Fatal("expected auto topic creation to be disabled")
+	}
+
+	writer, err := config.newWriter([]string{"namespace.servicebus.windows.net:9093"}, "pulsestream.events", KafkaPublisherConfig{})
+	if err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	defer writer.Close()
+
+	if !writer.AllowAutoTopicCreation {
+		// value should track config; this branch is only to force the next assertion block.
+	} else {
+		t.Fatal("expected writer auto topic creation to be disabled")
+	}
+
+	transport, ok := writer.Transport.(*kafka.Transport)
+	if !ok {
+		t.Fatalf("expected kafka transport, got %T", writer.Transport)
+	}
+	if transport.TLS == nil {
+		t.Fatal("expected TLS config to be set")
+	}
+	if transport.SASL == nil {
+		t.Fatal("expected SASL mechanism to be set")
+	}
+}
+
+func TestNewWriterAppliesOperationalTimeoutsAndRetries(t *testing.T) {
+	config := KafkaConnectionConfig{
+		SecurityProtocol:       KafkaSecurityProtocolPlaintext,
+		AllowAutoTopicCreation: true,
+	}
+
+	writer, err := config.newWriter([]string{"localhost:9092"}, "pulsestream.events", KafkaPublisherConfig{
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		MaxAttempts:  2,
+	})
+	if err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	defer writer.Close()
+
+	if writer.ReadTimeout != 2*time.Second {
+		t.Fatalf("expected read timeout to be applied, got %s", writer.ReadTimeout)
+	}
+	if writer.WriteTimeout != 3*time.Second {
+		t.Fatalf("expected write timeout to be applied, got %s", writer.WriteTimeout)
+	}
+	if writer.MaxAttempts != 2 {
+		t.Fatalf("expected max attempts to be applied, got %d", writer.MaxAttempts)
+	}
+}
+
+func TestLoadKafkaConnectionConfigRejectsInvalidSASLCombination(t *testing.T) {
+	t.Setenv("KAFKA_SECURITY_PROTOCOL", KafkaSecurityProtocolSASLSSL)
+	t.Setenv("KAFKA_SASL_MECHANISM", KafkaSASLMechanismPlain)
+	t.Setenv("KAFKA_SASL_USERNAME", "$ConnectionString")
+
+	_, err := LoadKafkaConnectionConfigFromEnv()
+	if err == nil {
+		t.Fatal("expected configuration error for missing SASL password")
+	}
+	if !strings.Contains(err.Error(), "KAFKA_SASL_PASSWORD") {
+		t.Fatalf("expected SASL password error, got %v", err)
 	}
 }
 

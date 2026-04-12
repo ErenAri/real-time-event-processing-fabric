@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -119,5 +120,67 @@ func TestQueryHandlerDefaultsTopSourcesToTokenTenant(t *testing.T) {
 	}
 	if reader.lastTopTenant != "tenant_01" {
 		t.Fatalf("expected tenant_01, got %q", reader.lastTopTenant)
+	}
+}
+
+func TestQueryHandlerEmitsEmptyArraysInsteadOfNull(t *testing.T) {
+	handler := NewQueryHandler(platform.NewLogger("test"), &fakeMetricsReader{
+		overview: store.Overview{},
+	}, nil, prometheus.NewRegistry())
+
+	overviewReq := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/overview", nil)
+	overviewRec := httptest.NewRecorder()
+	handler.handleOverview(overviewRec, overviewReq)
+	if overviewRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from overview, got %d", overviewRec.Code)
+	}
+	var overviewBody map[string]any
+	if err := json.Unmarshal(overviewRec.Body.Bytes(), &overviewBody); err != nil {
+		t.Fatalf("unmarshal overview body: %v", err)
+	}
+	if value, ok := overviewBody["recent_rejections"].([]any); !ok || value == nil {
+		t.Fatalf("expected recent_rejections to be an array, got %#v", overviewBody["recent_rejections"])
+	}
+
+	seriesReq := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/tenants/tenant_01?window=15m", nil)
+	seriesRec := httptest.NewRecorder()
+	handler.handleTenantSeries(seriesRec, seriesReq)
+	if seriesRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from tenant series, got %d", seriesRec.Code)
+	}
+	var seriesBody map[string]any
+	if err := json.Unmarshal(seriesRec.Body.Bytes(), &seriesBody); err != nil {
+		t.Fatalf("unmarshal series body: %v", err)
+	}
+	if value, ok := seriesBody["series"].([]any); !ok || value == nil {
+		t.Fatalf("expected series to be an array, got %#v", seriesBody["series"])
+	}
+
+	sourcesReq := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/sources/top?limit=5", nil)
+	sourcesRec := httptest.NewRecorder()
+	handler.handleTopSources(sourcesRec, sourcesReq)
+	if sourcesRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from top sources, got %d", sourcesRec.Code)
+	}
+	var sourcesBody map[string]any
+	if err := json.Unmarshal(sourcesRec.Body.Bytes(), &sourcesBody); err != nil {
+		t.Fatalf("unmarshal sources body: %v", err)
+	}
+	if value, ok := sourcesBody["sources"].([]any); !ok || value == nil {
+		t.Fatalf("expected sources to be an array, got %#v", sourcesBody["sources"])
+	}
+
+	rejectionsReq := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/rejections?limit=5", nil)
+	rejectionsRec := httptest.NewRecorder()
+	handler.handleRejections(rejectionsRec, rejectionsReq)
+	if rejectionsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from rejections, got %d", rejectionsRec.Code)
+	}
+	var rejectionsBody map[string]any
+	if err := json.Unmarshal(rejectionsRec.Body.Bytes(), &rejectionsBody); err != nil {
+		t.Fatalf("unmarshal rejections body: %v", err)
+	}
+	if value, ok := rejectionsBody["rejections"].([]any); !ok || value == nil {
+		t.Fatalf("expected rejections to be an array, got %#v", rejectionsBody["rejections"])
 	}
 }

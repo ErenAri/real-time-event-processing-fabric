@@ -2,9 +2,11 @@ package processor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,11 +25,22 @@ import (
 type fakeReader struct {
 	messages chan kafka.Message
 
-	mu        sync.Mutex
-	committed []kafka.Message
+	mu         sync.Mutex
+	committed  []kafka.Message
+	fetchErrs  []error
+	commitErrs []error
 }
 
 func (f *fakeReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	f.mu.Lock()
+	if len(f.fetchErrs) > 0 {
+		err := f.fetchErrs[0]
+		f.fetchErrs = f.fetchErrs[1:]
+		f.mu.Unlock()
+		return kafka.Message{}, err
+	}
+	f.mu.Unlock()
+
 	select {
 	case <-ctx.Done():
 		return kafka.Message{}, ctx.Err()
@@ -39,6 +52,12 @@ func (f *fakeReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
 func (f *fakeReader) CommitMessages(ctx context.Context, messages ...kafka.Message) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if len(f.commitErrs) > 0 {
+		err := f.commitErrs[0]
+		f.commitErrs = f.commitErrs[1:]
+		return err
+	}
 	f.committed = append(f.committed, messages...)
 	return nil
 }
@@ -88,6 +107,15 @@ func (s *blockingStore) RecordProcessedEvent(ctx context.Context, event events.T
 type successfulStore struct{}
 
 func (s *successfulStore) RecordProcessedEvent(context.Context, events.TelemetryEvent) (bool, error) {
+	return true, nil
+}
+
+type countingStore struct {
+	processed atomic.Int64
+}
+
+func (s *countingStore) RecordProcessedEvent(context.Context, events.TelemetryEvent) (bool, error) {
+	s.processed.Add(1)
 	return true, nil
 }
 
@@ -356,5 +384,97 @@ func TestRunnerCreatesProcessAndCommitSpansFromKafkaHeaders(t *testing.T) {
 	}
 	if !foundCommit {
 		t.Fatalf("expected commit span to be recorded under %q", processSpanName)
+	}
+}
+
+func TestRunnerRetriesFetchErrorsUntilBrokerRecovers(t *testing.T) {
+	reader := &fakeReader{
+		messages:  make(chan kafka.Message, 1),
+		fetchErrs: []error{errors.New("dial tcp: connect refused")},
+	}
+	store := &countingStore{}
+	runner := NewRunner(reader, store, nil, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		RetryBackoff: 10 * time.Millisecond,
+	})
+
+	payload, err := events.EncodeTelemetryEvent(events.TelemetryEvent{
+		SchemaVersion: events.CurrentSchemaVersion,
+		EventID:       "evt-fetch-retry",
+		TenantID:      "tenant_01",
+		SourceID:      "sensor_001",
+		EventType:     "telemetry",
+		Timestamp:     time.Now().UTC(),
+		Value:         10,
+		Status:        events.StatusOK,
+		Region:        "eu-west",
+		Sequence:      1,
+	})
+	if err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+	reader.messages <- kafka.Message{Partition: 0, Offset: 1, Value: payload}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.Run(ctx)
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for store.processed.Load() == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("runner did not recover from fetch error")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner returned error after transient fetch failure: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not stop")
+	}
+}
+
+func TestRunnerRetriesCommitErrorsUntilCommitSucceeds(t *testing.T) {
+	reader := &fakeReader{
+		messages:   make(chan kafka.Message, 1),
+		commitErrs: []error{errors.New("commit failed"), errors.New("commit failed again")},
+	}
+	store := &successfulStore{}
+	runner := NewRunner(reader, store, nil, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		RetryBackoff: 10 * time.Millisecond,
+	})
+
+	payload, err := events.EncodeTelemetryEvent(events.TelemetryEvent{
+		SchemaVersion: events.CurrentSchemaVersion,
+		EventID:       "evt-commit-retry",
+		TenantID:      "tenant_01",
+		SourceID:      "sensor_001",
+		EventType:     "telemetry",
+		Timestamp:     time.Now().UTC(),
+		Value:         10,
+		Status:        events.StatusOK,
+		Region:        "eu-west",
+		Sequence:      1,
+	})
+	if err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+
+	if err := runner.handleMessage(context.Background(), kafka.Message{Topic: "pulsestream.events", Partition: 0, Offset: 1, Value: payload}); err != nil {
+		t.Fatalf("handle message: %v", err)
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	if len(reader.committed) != 1 {
+		t.Fatalf("expected commit after retries, got %d committed messages", len(reader.committed))
 	}
 }
