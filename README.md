@@ -1,82 +1,120 @@
 # PulseStream
 
-PulseStream is a real-time event analytics platform built to demonstrate streaming-system fundamentals instead of CRUD breadth. The MVP ingests synthetic telemetry events through a Go HTTP service, publishes them to Kafka, processes them in near real time, stores hot views in PostgreSQL, and exposes a live React dashboard plus Prometheus-ready operational metrics.
+PulseStream is a real-time event analytics platform for synthetic telemetry. It ingests events through a Go HTTP service, publishes them to Kafka, processes them in near real time, stores hot operational views in PostgreSQL, archives raw payloads for replay, and exposes a React dashboard plus operator APIs.
 
-## MVP scope
+## What the project demonstrates
 
-- Go services for ingest, stream processing, query, and synthetic load generation
-- Kafka-backed event pipeline with idempotent-at-least-once processing and poison-message dead-lettering
-- PostgreSQL hot views for tenant and source aggregates
-- Immutable raw-event archive plus admin replay for recovery and backfills
-- React + Vite live dashboard polling the query service every 2 seconds
-- Prometheus scraping, Grafana provisioning, and JSON structured service logs
-- Docker Compose topology and GitHub Actions CI
+- Event-driven architecture with a broker-backed write path
+- Idempotent at-least-once processing with duplicate suppression
+- Separation of hot operational state and cold raw event storage
+- JWT authentication, tenant-scoped authorization, and PostgreSQL row-level security
+- Failure handling with restart, poison-message, broker-outage, Postgres-pause, and replay drills
+- Processor replica scaling with measured throughput and lag
+- Operational telemetry through Prometheus, Grafana, structured logs, and OpenTelemetry hooks
+- AsyncAPI and JSON Schema contract governance
+- Azure-aligned runtime path through Event Hubs-compatible Kafka settings, Blob-backed archive support, and Container Apps deployment scaffolding
 
-## Repository layout
+## Architecture
 
-```text
-services/
-  producer-simulator/
-  ingest-service/
-  stream-processor/
-  query-service/
-internal/
-  api/
-  events/
-  platform/
-  processor/
-  simulator/
-  store/
-  telemetry/
-web/dashboard/
-schemas/
-deploy/docker-compose/
-deploy/azure/container-apps/
-docs/
-scripts/
-asyncapi.yaml
+```mermaid
+flowchart LR
+    PS[producer-simulator]
+    IS[ingest-service]
+    RA[(raw archive)]
+    K[(Kafka topic)]
+    DLQ[(Kafka DLQ)]
+    SP1[stream-processor replica 1]
+    SPN[stream-processor replica N]
+    DB[(PostgreSQL hot views)]
+    QS[query-service]
+    UI[React dashboard]
+    PM[Prometheus]
+    GF[Grafana]
+
+    PS -->|HTTP events| IS
+    IS -->|append raw payload| RA
+    IS -->|publish| K
+    K --> SP1
+    K --> SPN
+    SP1 -->|poison records| DLQ
+    SPN -->|poison records| DLQ
+    SP1 -->|aggregate and deduplicate| DB
+    SPN -->|aggregate and deduplicate| DB
+    QS -->|read| DB
+    UI -->|poll| QS
+    IS --> PM
+    SP1 --> PM
+    SPN --> PM
+    QS --> PM
+    PS --> PM
+    PM --> GF
 ```
+
+## Services
+
+| Component | Responsibility |
+| --- | --- |
+| `producer-simulator` | Generates synthetic telemetry, duplicates, malformed payloads, and burst traffic |
+| `ingest-service` | Authenticates producers, validates events, records rejections, writes raw archive entries, and publishes to Kafka |
+| `stream-processor` | Consumes Kafka partitions, deduplicates by `event_id`, dead-letters poison records, computes aggregates, and writes hot views |
+| `query-service` | Serves overview, tenant-series, top-source, rejection, and tenant-scoped dashboard APIs |
+| `dashboard` | Renders live operator views from the query API |
+| `Prometheus` and `Grafana` | Scrape and display platform metrics |
+
+## Current evidence
+
+| Scenario | Artifact | Summary |
+| --- | --- | --- |
+| Single processor benchmark | `artifacts/benchmarks/benchmark-20260410-212955.json` | `713.09 accepted eps`, `568.43 processed eps`, `p95 14 ms`, `lag peak 1308` |
+| Three processor benchmark | `artifacts/benchmarks/benchmark-20260410-213110.json` | `700.37 accepted eps`, `595.02 processed eps`, `p95 11 ms`, `lag peak 1246` |
+| Three replica restart drill | `artifacts/failure-drills/restart-processor-20260410-212812.json` | one processor replica restarted during load, `0` rejections, `p95 11 ms`, `lag peak 828` |
+| Poison-message drill | `artifacts/failure-drills/inject-poison-message-20260411-152328.json` | malformed Kafka record moved to DLQ and surfaced through `dead_letter_total` |
+| Broker outage drill | `artifacts/failure-drills/broker-outage-20260416-201249.json` | `12s` Kafka outage, `0` archive accounting gap, explicit `publish_failed` and `backpressure` rejections |
+| PostgreSQL pause drill | `artifacts/failure-drills/pause-postgres-20260416-202040.json` | `12s` Postgres pause, visible query degradation, processing resumed `1.24s` after Postgres became healthy |
+| Replay and rebuild drill | `artifacts/failure-drills/replay-archive-20260416173251.json` | `25` replayed duplicates produced `0` overcount; scoped reset rebuilt hot views back to `25` |
+
+Current local evidence shows that replica scaling improves processor-side throughput and tail latency, but the producer path is limiting higher-rate local measurements. The next measurement gap is a higher-capacity producer profile or a cloud deployment variant that can stress the consumer group more aggressively.
 
 ## Quick start
 
-1. Build and start the local stack:
+1. Start the local stack.
 
    ```powershell
    docker compose -f deploy/docker-compose/docker-compose.yml up --build
    ```
 
-2. Open the live surfaces:
+2. Open the local surfaces.
 
-    - Dashboard: `http://localhost:4173`
-    - Query API: `http://localhost:8081/api/v1/metrics/overview` with `Authorization: Bearer <jwt>`
-    - Ingest API: `http://localhost:8080/api/v1/events`
-    - Prometheus: `http://localhost:9090`
-    - Grafana: `http://localhost:3000` with `admin` / `admin`
+   - Dashboard: `http://localhost:4173`
+   - Query API: `http://localhost:8081/api/v1/metrics/overview` with `Authorization: Bearer <jwt>`
+   - Ingest API: `http://localhost:8080/api/v1/events`
+   - Prometheus: `http://localhost:9090`
+   - Grafana: `http://localhost:3000` with `admin` / `admin`
 
-3. Run the benchmark driver:
-
-   ```powershell
-   ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 60 -ProcessorReplicas 3
-   ```
-
-    The benchmark driver defaults to a one-off Compose-network producer so the published artifacts are not distorted by Windows host networking. It can also scale the processor service before a run and records the observed replica count in the artifact.
-
-4. Run the poison-message drill:
+3. Run a benchmark.
 
    ```powershell
-   ./scripts/chaos/inject-poison-message.ps1
+   ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
    ```
 
-   The drill pauses the compose simulator, launches a temporary processor with a fresh consumer group at the current topic tail, writes one malformed record directly to Kafka, and captures the resulting `dead_letter_total` delta as a JSON artifact.
+4. Run a restart drill.
 
-5. Validate the asynchronous contract:
+   ```powershell
+   ./scripts/chaos/restart-processor.ps1 -Rate 1000 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+   ```
+
+5. Run the replay and rebuild drill.
+
+   ```powershell
+   ./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 90
+   ```
+
+6. Validate the asynchronous contract.
 
    ```powershell
    npm install
    npm run contract:validate
    ```
-
-   The contract is defined in [asyncapi.yaml](/C:/Projects/real-time-event-processing-fabric/asyncapi.yaml) and reuses the JSON Schemas under [schemas/](/C:/Projects/real-time-event-processing-fabric/schemas).
 
 ## Local auth
 
@@ -91,96 +129,60 @@ go run ./cmd/dev-token `
   -secret pulsestream-dev-secret
 ```
 
-## Current architecture
+Admin tokens can query any tenant and call replay endpoints. `tenant_user` tokens are restricted to their assigned `tenant_id`. Health, readiness, and Prometheus metrics endpoints remain unauthenticated.
 
-```mermaid
-graph TD
-    subgraph Load Generation
-        PS[producer-simulator<br>Synthetic Telemetry]
-    end
+## Repository layout
 
-    subgraph Ingestion Layer
-        IS[ingest-service]
-        RA[(Raw Archive<br>NDJSON)]
-    end
-
-    subgraph Storage & Broker
-        K[Kafka<br>pulsestream.events]
-        DLQ[Kafka DLQ<br>pulsestream.events.dlq]
-        DB[(PostgreSQL<br>Hot Views, State, Rejections)]
-    end
-
-    subgraph Processing Layer
-        SP[stream-processor<br>Idempotent, Partition-Parallel]
-    end
-
-    subgraph Serving Layer
-        QS[query-service]
-        UI[React Dashboard]
-    end
-
-    PS -->|HTTP POST| IS
-    IS -->|Cold Storage Write| RA
-    IS -->|Publish Event| K
-    
-    K -->|Consume| SP
-    SP -->|Poison Records| DLQ
-    SP -->|Aggregate / Upsert| DB
-    
-    UI -->|Polls every 2s| QS
-    QS -->|Query| DB
+```text
+services/
+  producer-simulator/
+  ingest-service/
+  stream-processor/
+  query-service/
+internal/
+  api/
+  archive/
+  events/
+  platform/
+  processor/
+  simulator/
+  store/
+  telemetry/
+web/dashboard/
+deploy/docker-compose/
+deploy/azure/container-apps/
+docs/
+scripts/
+schemas/
+asyncapi.yaml
 ```
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [API specification](docs/api-spec.md)
+- [Data model](docs/data-model.md)
+- [Benchmarking](docs/benchmarking.md)
+- [Failure modes](docs/failure-modes.md)
+- [Runbook](docs/runbook.md)
 
 ## Contract governance
 
-- [asyncapi.yaml](/C:/Projects/real-time-event-processing-fabric/asyncapi.yaml) documents the Kafka topics, operations, headers, and examples for `pulsestream.events` and `pulsestream.events.dlq`
-- [telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json) is the source payload schema for accepted telemetry events
-- [dead-letter-record-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/dead-letter-record-v1.schema.json) defines the processor-side poison-message payload
+- [asyncapi.yaml](asyncapi.yaml) documents the Kafka topics, operations, headers, and examples for `pulsestream.events` and `pulsestream.events.dlq`
+- [telemetry-event-v1.schema.json](schemas/telemetry-event-v1.schema.json) is the source payload schema for accepted telemetry events
+- [dead-letter-record-v1.schema.json](schemas/dead-letter-record-v1.schema.json) defines the processor-side poison-message payload
 - GitHub Actions validates the AsyncAPI document on every push and pull request
 
 ## Azure variant
 
-- The Kafka client layer now supports local `PLAINTEXT` Kafka and Azure Event Hubs via `SASL_SSL` plus `PLAIN` credentials from environment variables
-- Azure Container Apps deployment scaffolding for the backend services lives under [deploy/azure/container-apps](/C:/Projects/real-time-event-processing-fabric/deploy/azure/container-apps)
-- The ingest service now supports a Blob-backed raw archive for durable Azure replay, using managed identity by default
+- The Kafka client layer supports local `PLAINTEXT` Kafka and Azure Event Hubs via `SASL_SSL` plus `PLAIN` credentials from environment variables
+- Azure Container Apps deployment scaffolding for the backend services lives under [deploy/azure/container-apps](deploy/azure/container-apps)
+- The ingest service supports a Blob-backed raw archive for durable Azure replay, using managed identity by default
 - The deployment template assumes existing Event Hubs, Blob Storage, and PostgreSQL dependencies and focuses on application hosting first
 
-## Evidence goals
+## Current limits
 
-- Throughput target: `5k events/sec` sustained for the MVP benchmark gate
-- Dashboard freshness target: under `2s`
-- Failure proofs: processor restart, duplicate handling, malformed burst handling, broker outage handling, PostgreSQL slowdown drill, archive replay and hot-view rebuild
-- Docs and runbooks: see the files under [`docs/`](docs)
-
-## Status
-
-The codebase implements the MVP pipeline, local platform wiring, JWT auth, tenant-scoped authorization, PostgreSQL row-level security, poison-message dead-lettering, Kafka trace propagation, contract validation, an Event Hubs-compatible Kafka transport layer, a Blob-backed Azure hosting path, processor-side Kafka retry handling, and an explicit ingest in-flight backpressure gate. Redis caching, Azure dashboard deployment, and Azure benchmark evidence remain follow-on work.
-
-Current benchmark evidence shows the ingest path sustaining roughly `1.2k accepted eps` and the optimized processor sustaining roughly `876 processed eps` under the documented Compose benchmark profile. The repo now also has scale-aware evidence for processor replicas: under the current exact-count harness, a `3`-replica processor run processed `595.02 eps` versus `568.43 eps` for `1` replica, with better `p95`/`p99` latency and slightly lower peak lag. The next engineering gap is raising producer-side offered load so processor scaling can be measured under a harder sustained profile.
- 
-Poison-message handling is now verified in the scripted drill artifact `artifacts/failure-drills/inject-poison-message-20260411-152328.json`: a malformed record written directly to `pulsestream.events` was consumed by a fresh-group processor, published to `pulsestream.events.dlq`, and surfaced through `dead_letter_total` in the overview API.
-
-Broker-outage handling is now verified in `artifacts/failure-drills/broker-outage-20260416-201249.json`: with an `800 eps` target load and a `12s` Kafka outage, the processor stayed alive, Kafka health was detected during the run, accepted traffic recovered within the observation window, and raw-archive accounting closed with a `0` event gap. The run recorded `2,980` explicit `publish_failed` rejections and `19,100` explicit `backpressure` rejections. The remaining gap is that the producer log still contained `278` client-side timeouts, so ingest overload behavior is improved but not fully clean yet.
-
-PostgreSQL pause handling is now verified in `artifacts/failure-drills/pause-postgres-20260416-202040.json`: with an `800 eps` target load and a `12s` Postgres pause, ingest accepted and archived `26,195` events, query overview calls failed visibly while the dependency was paused, processor in-flight peaked at `485`, and processing resumed `1.24s` after Postgres reported healthy. The remaining gap is elevated final consumer lag and a small number of producer-side timeouts during the DB stall.
-
-Archive replay and hot-view rebuild are now verified in `artifacts/failure-drills/replay-archive-20260416173251.json`: the drill created a sentinel tenant with `25` accepted events, replayed the archived events once, observed `25` duplicate discards with `0` source-metric overcount, reset only the sentinel tenant's hot-view and dedup rows, replayed again, and rebuilt the processed-event and source-metric counts back to `25`. The remaining gap is replay efficiency: the current date-partitioned flat-file archive scanned `498,706` records to replay `25`, so production-scale replay needs tenant/time indexing or object-prefix partitioning.
-
-## Admin replay
-
-The ingest service exposes a local admin replay endpoint guarded by `X-Admin-Token` or `Authorization: Bearer <token>`.
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://localhost:8080/api/v1/admin/replay `
-  -Headers @{ "X-Admin-Token" = "pulsestream-dev-admin" } `
-  -ContentType "application/json" `
-  -Body '{"start_date":"2026-04-10","tenant_id":"tenant_01","limit":500}'
-```
-
-For a repeatable proof that replay is duplicate-safe and can rebuild hot views for a scoped tenant, run:
-
-```powershell
-./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 90
-```
+- Redis caching is not part of the current hot path; PostgreSQL remains the only operational read store.
+- Azure dashboard deployment and published Azure benchmark evidence are still follow-on work.
+- The benchmark harness is credible for local evidence, but local producer throughput is currently the next limiting factor.
+- The local date-partitioned archive scanned `498,706` records to replay `25` in the latest drill, so production-scale replay needs tenant/time indexing or object-prefix partitioning.

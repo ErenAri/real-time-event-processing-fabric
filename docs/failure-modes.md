@@ -1,35 +1,71 @@
 # Failure Modes
 
+## Summary table
+
+| Scenario | Trigger | Expected behavior | Current evidence |
+| --- | --- | --- | --- |
+| Processor restart during load | `./scripts/chaos/restart-processor.ps1` | ingest continues, lag rises, processor group resumes work | captured |
+| Duplicate injection | simulator `SIM_DUPLICATE_EVERY` or archive replay | duplicates are accepted then discarded by the processor | captured through replay drill |
+| Malformed ingest payload burst | simulator `SIM_MALFORMED_EVERY` | ingest rejects bad payloads and records rejection rows | captured in steady-state simulator activity |
+| Poison message already in Kafka | `./scripts/chaos/inject-poison-message.ps1` | processor dead-letters the bad record and commits after DLQ publish | captured |
+| PostgreSQL pause or slowdown | `./scripts/chaos/pause-postgres.ps1` | processor write path degrades and recovers after Postgres resumes | captured |
+| Broker outage | `./scripts/chaos/broker-outage.ps1` | publish failures and backpressure become visible; processor survives broker loss | captured |
+| Replay and rebuild | `./scripts/chaos/replay-archive.ps1` | archived events are republished, duplicates are ignored, and scoped hot views can be rebuilt | captured |
+
 ## Processor restart during load
 
-- Trigger: `./scripts/chaos/restart-processor.ps1`
-- Scale-aware option: `./scripts/chaos/restart-processor.ps1 -ProcessorReplicas 3`
-- Expected behavior: ingest continues accepting traffic, Kafka buffers messages, processor lag spikes and then drains after restart
-- Observed run: `artifacts/failure-drills/restart-processor-20260410-192413.json`
-- Observed behavior: at `1000 eps` target load, ingest continued accepting traffic with `0` new rejections while the processor container restarted in roughly `1.54s`
-- Observed behavior: accepted traffic increased by `22,997` events during the drill, processed traffic increased by `7,571`, duplicate discards increased by `13`
-- Observed behavior: consumer lag was already elevated before restart (`60,351`), peaked at `94,342`, and did not recover within the `30s` observation window; final lag remained `77,065`
-- Observed rerun after processor optimization: `artifacts/failure-drills/restart-processor-20260410-194815.json`
-- Observed rerun behavior: accepted traffic increased by `22,977` events, processed traffic increased by `19,479`, duplicate discards increased by `104`, and `0` new rejections were recorded
-- Observed rerun behavior: the processor still did not recover within the `30s` window because pre-existing lag was already high (`143,169` before restart), but the processor did materially more useful work during the drill and kept `p95`/`p99` processing latency at `13ms` / `25ms`
-- Observed multi-replica rerun: `artifacts/failure-drills/restart-processor-20260410-212812.json`
-- Observed multi-replica behavior: with `3` processor replicas and a `1000 eps` target load, restarting one replica increased accepted traffic by `27,406` events while processed traffic increased by `31,860`; no new rejections were recorded and `p95`/`p99` stayed at `11ms` / `19ms`
-- Observed multi-replica behavior: consumer lag started at `0`, peaked at `828`, and remained `828` at the end of the `30s` drill window, so the group absorbed the restart cleanly but still did not fully drain the backlog inside the observation window
-- Interpretation: restart recovery mechanics work and the optimized processor is materially stronger than the first run, but the system still needs more sustained processor capacity before claiming near-real-time catch-up under continuous `1000 eps` load with existing backlog
-- Current drill tooling restarts a single processor replica container and samples aggregate processor counters through Prometheus, so the same script can now be used for single-replica or scaled consumer-group recovery evidence
-- Recovery lever: use the replay endpoint if hot views must be rebuilt from the raw archive
+```mermaid
+sequenceDiagram
+    participant Producer as benchmark producer
+    participant Ingest as ingest-service
+    participant Kafka as Kafka
+    participant P1 as processor replica A
+    participant P2 as processor replica B/C
+    participant Prom as Prometheus
 
-## Duplicate event injection
+    Producer->>Ingest: send events continuously
+    Ingest->>Kafka: publish accepted events
+    Kafka-->>P1: partition assignments
+    Kafka-->>P2: partition assignments
+    Note over P1: one replica is restarted
+    Kafka-->>P2: remaining replicas continue processing
+    P1-->>Kafka: consumer rejoins after restart
+    Prom-->>Prom: lag and latency sampled during the drill
+```
 
-- Trigger: simulator configuration with `SIM_DUPLICATE_EVERY`
-- Expected behavior: ingest accepts duplicates, processor discards them via `processed_events`
-- Evidence to capture: `duplicate_total` increases while tenant aggregates do not overcount
+### Single-replica evidence
 
-## Malformed payload burst
+- Artifact: `artifacts/failure-drills/restart-processor-20260410-192413.json`
+- Result: `22,997` accepted events, `7,571` processed events, `0` new rejections
+- Result: lag started high, peaked at `94,342`, and did not recover within the `30s` window
 
-- Trigger: simulator configuration with `SIM_MALFORMED_EVERY`
-- Expected behavior: ingest returns `400`, records rejection rows, and continues serving valid traffic
-- Evidence to capture: rejection timeline and `pulsestream_ingest_rejected_total`
+### Optimized single-replica evidence
+
+- Artifact: `artifacts/failure-drills/restart-processor-20260410-194815.json`
+- Result: `22,977` accepted events, `19,479` processed events, `0` new rejections
+- Result: latency stayed at `13 ms p95` and `25 ms p99`, but backlog still did not drain inside the drill window
+
+### Multi-replica evidence
+
+- Artifact: `artifacts/failure-drills/restart-processor-20260410-212812.json`
+- Configuration: `3` processor replicas, restart of one replica during active load
+- Result: `27,406` accepted events, `31,860` processed events, `8,466` duplicates, `0` new rejections
+- Result: lag started at `0`, peaked at `828`, and remained `828` at the end of the `30s` window
+- Result: latency stayed at `11 ms p95` and `19 ms p99`
+
+## Duplicate handling
+
+- Mechanism: the processor writes `event_id` into `processed_events` and skips aggregate updates when the insert is not claimed
+- Observable signal: `pulsestream_processor_duplicate_total`
+- Captured proof: `artifacts/failure-drills/replay-archive-20260416173251.json`
+- Result: replaying `25` already-processed events produced `25` duplicate discards and `0` source-metric overcount
+
+## Malformed ingest payload handling
+
+- Mechanism: ingest validation failures and decode failures are returned as `400` responses and written to `rejection_events`
+- Observable signal: `pulsestream_ingest_rejected_total`
+- Operator API: `GET /api/v1/metrics/rejections`
+- Current state: the steady-state simulator can intentionally emit malformed payloads and the rejection timeline confirms that those failures are isolated from valid traffic
 
 ## Poison message already in Kafka
 

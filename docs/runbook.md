@@ -18,15 +18,61 @@ docker compose -f deploy/docker-compose/docker-compose.yml down
 docker compose -f deploy/docker-compose/docker-compose.yml down -v
 ```
 
-This removes Kafka and PostgreSQL local volumes and resets the hot views.
+This removes Kafka, PostgreSQL, and local Prometheus data and resets the hot views.
 
-## Inspect health
+## Local endpoints
 
-- Ingest health: `http://localhost:8080/healthz`
-- Query health: `http://localhost:8081/healthz`
-- Simulator metrics: `http://localhost:8083/metrics`
-- Processor replica status: `docker compose -f deploy/docker-compose/docker-compose.yml ps stream-processor`
-- Processor metrics: query Prometheus at `http://localhost:9090`
+| Surface | URL |
+| --- | --- |
+| Dashboard | `http://localhost:4173` |
+| Ingest API | `http://localhost:8080` |
+| Query API | `http://localhost:8081` |
+| Prometheus | `http://localhost:9090` |
+| Grafana | `http://localhost:3000` |
+
+## Health checks
+
+| Service | Check |
+| --- | --- |
+| `ingest-service` | `http://localhost:8080/healthz` |
+| `query-service` | `http://localhost:8081/healthz` |
+| `producer-simulator` | `http://localhost:8083/healthz` |
+| `stream-processor` replicas | `docker compose -f deploy/docker-compose/docker-compose.yml ps stream-processor` |
+
+## Mint a local token
+
+```powershell
+go run ./cmd/dev-token `
+  -role admin `
+  -subject local-admin `
+  -secret pulsestream-dev-secret
+```
+
+Use the resulting value as `Authorization: Bearer <jwt>` for ingest and query APIs.
+
+## Scale processor replicas
+
+```powershell
+docker compose -f deploy/docker-compose/docker-compose.yml up -d --scale stream-processor=3 stream-processor prometheus
+```
+
+Prometheus must be included in the command because scrape target discovery depends on the current Docker container set.
+
+## Run a benchmark
+
+```powershell
+./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+```
+
+The script writes a JSON artifact to `artifacts/benchmarks/`.
+
+## Run a restart drill
+
+```powershell
+./scripts/chaos/restart-processor.ps1 -Rate 1000 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+```
+
+The script writes a JSON artifact to `artifacts/failure-drills/`.
 
 ## Replay archived events
 
@@ -39,7 +85,7 @@ Invoke-RestMethod `
   -Body '{"start_date":"2026-04-10","tenant_id":"tenant_01","limit":500}'
 ```
 
-The archive is stored in the ingest container at `/var/lib/pulsestream/archive` and on the host via the `archive-data` Docker volume.
+The archive is stored in the ingest container at `/var/lib/pulsestream/archive` and on the host through the `archive-data` Docker volume.
 
 Use the scripted replay drill when you need repeatable evidence that replay is duplicate-safe and can rebuild scoped hot views:
 
@@ -51,16 +97,27 @@ The drill creates a unique sentinel tenant, verifies the first replay is discard
 
 ## Investigate lag
 
-1. Check `pulsestream_processor_consumer_lag` in Prometheus.
-2. Confirm the processor replicas are running with `docker compose ... ps stream-processor`.
-3. Inspect processor logs for database or decode failures.
-4. Compare ingest accepted totals against processed totals in the overview API.
+1. Query Prometheus for `sum(pulsestream_processor_consumer_lag)`.
+2. Check processor replicas with:
+
+   ```powershell
+   docker compose -f deploy/docker-compose/docker-compose.yml ps stream-processor
+   ```
+
+3. Inspect processor logs:
+
+   ```powershell
+   docker compose -f deploy/docker-compose/docker-compose.yml logs stream-processor
+   ```
+
+4. Compare `accepted_total` and `processed_total` in `GET /api/v1/metrics/overview`.
 
 ## Investigate rejection spikes
 
 1. Query `GET /api/v1/metrics/rejections`.
-2. Inspect `pulsestream_ingest_rejected_total` by `reason`.
-3. Confirm whether the simulator is intentionally emitting malformed payloads or if Kafka publishing is failing.
+2. Query Prometheus for `pulsestream_ingest_rejected_total`.
+3. Confirm whether malformed payload injection is expected from the simulator.
+4. Inspect ingest logs for `publish_failed`, `backpressure`, or validation errors.
 
 ## Investigate dead-letter activity
 
@@ -68,22 +125,33 @@ The drill creates a unique sentinel tenant, verifies the first replay is discard
 2. Inspect processor logs for `message_dead_lettered`.
 3. Run the scripted poison-message drill when you need a clean end-to-end verification path:
 
-```powershell
-./scripts/chaos/inject-poison-message.ps1
-```
+   ```powershell
+   ./scripts/chaos/inject-poison-message.ps1
+   ```
 
 4. Read the DLQ topic from Kafka:
 
-```powershell
-docker exec docker-compose-kafka-1 sh -lc `
-  "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic pulsestream.events.dlq --from-beginning --max-messages 10 --timeout-ms 5000"
-```
+   ```powershell
+   docker exec docker-compose-kafka-1 sh -lc `
+     "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic pulsestream.events.dlq --from-beginning --max-messages 10 --timeout-ms 5000"
+   ```
 
 5. Confirm the DLQ record contains the expected source topic, source offset, consumer group, and reason before deciding whether to replay or discard the source data.
+
+## Investigate Prometheus target health
+
+1. Open `http://localhost:9090/api/v1/targets?state=any`.
+2. Confirm that each processor replica appears as a separate `stream-processor` target.
+3. If Docker discovery is empty, recreate Prometheus:
+
+   ```powershell
+   docker compose -f deploy/docker-compose/docker-compose.yml up -d --force-recreate prometheus
+   ```
 
 ## Recovery drills
 
 - Restart processor: `./scripts/chaos/restart-processor.ps1`
 - Inject poison message: `./scripts/chaos/inject-poison-message.ps1`
 - Pause Postgres: `./scripts/chaos/pause-postgres.ps1`
+- Broker outage: `./scripts/chaos/broker-outage.ps1`
 - Replay archive and rebuild hot views: `./scripts/chaos/replay-archive.ps1`
