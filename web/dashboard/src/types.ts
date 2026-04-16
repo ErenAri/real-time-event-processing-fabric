@@ -12,6 +12,7 @@ export interface Overview {
   rejected_total: number;
   processed_total: number;
   duplicate_total: number;
+  dead_letter_total: number;
   consumer_lag: number;
   processor_instances: number;
   processor_active_partitions: number;

@@ -2,7 +2,7 @@
 
 ## Scope
 
-PulseStream is a local-first event analytics platform that emphasizes distributed-systems concerns over product breadth. The current implementation focuses on ingestion, streaming aggregation, replay, observability, and measurable failure behavior.
+PulseStream is a local-first event analytics platform that emphasizes distributed-systems concerns over product breadth. The current implementation focuses on ingestion, streaming aggregation, replay, observability, tenant isolation, and measurable failure behavior.
 
 ## System diagram
 
@@ -16,6 +16,7 @@ flowchart LR
         IS[ingest-service]
         RA[(raw archive)]
         K[(Kafka)]
+        DLQ[(Kafka DLQ)]
     end
 
     subgraph Processing
@@ -47,6 +48,9 @@ flowchart LR
     SP1 --> DB
     SP2 --> DB
     SPN --> DB
+    SP1 --> DLQ
+    SP2 --> DLQ
+    SPN --> DLQ
     QS --> DB
     UI --> QS
     PS --> PM
@@ -57,6 +61,19 @@ flowchart LR
     QS --> PM
     PM --> GF
 ```
+
+## Components
+
+- `producer-simulator`: emits synthetic telemetry at configurable rates, including duplicates, malformed payloads, and burst traffic
+- `ingest-service`: authenticates producers, validates event payloads, records rejections, archives raw events, publishes accepted events to Kafka, and exposes the replay endpoint
+- `raw archive`: immutable NDJSON or Blob-backed event log written before broker publish, used for replay and backfills
+- `stream-processor`: consumes Kafka partitions, processes partitions in parallel while preserving per-partition ordering, deduplicates by `event_id`, dead-letters poison records, computes hot aggregates, and stores per-instance service state snapshots
+- `query-service`: exposes tenant-scoped low-latency operational APIs for dashboard reads
+- `PostgreSQL`: hot store for aggregate buckets, source counters, rejection history, deduplication state, row-level security, and service state
+- `Kafka`: durable broker between write and processing paths, with a dedicated DLQ topic for processor-side poison messages
+- `dashboard`: React UI for throughput, lag, latency, and rejection visibility
+- `Prometheus` and `Grafana`: metrics collection and local operational visibility
+- `asyncapi.yaml` plus JSON Schemas: checked-in asynchronous contract for Kafka topics, headers, and payloads
 
 ## Write path
 
@@ -70,13 +87,17 @@ sequenceDiagram
     participant Postgres as PostgreSQL
 
     Producer->>Ingest: POST /api/v1/events
-    Ingest->>Ingest: validate schema and required fields
-    Ingest->>Archive: append NDJSON record
+    Ingest->>Ingest: authenticate and validate schema
+    Ingest->>Archive: append raw payload
     Ingest->>Kafka: publish accepted event
     Kafka-->>Processor: deliver message
     Processor->>Processor: decode and deduplicate
     Processor->>Postgres: upsert hot aggregates and service state
 ```
+
+Poison-message path:
+
+`Kafka -> stream-processor -> pulsestream.events.dlq`
 
 ## Read path
 
@@ -87,6 +108,7 @@ sequenceDiagram
     participant Postgres as PostgreSQL
 
     UI->>Query: GET /api/v1/metrics/overview
+    Query->>Query: authorize tenant scope
     Query->>Postgres: read overview and service state
     Postgres-->>Query: aggregates and recent rejections
     Query-->>UI: overview payload
@@ -104,7 +126,7 @@ sequenceDiagram
     participant Postgres as PostgreSQL
 
     Admin->>Ingest: POST /api/v1/admin/replay
-    Ingest->>Archive: scan archived NDJSON files
+    Ingest->>Archive: scan archived NDJSON or Blob records
     Ingest->>Kafka: republish matching events
     Kafka-->>Processor: replayed messages
     Processor->>Postgres: reapply aggregates, skip duplicates
@@ -136,12 +158,14 @@ Each processor replica writes an instance-scoped heartbeat and metric snapshot i
 
 | Decision | Current choice | Reason |
 | --- | --- | --- |
-| Broker | Kafka | Strong local reproducibility and direct visibility into partitions, offsets, and consumer groups |
+| Broker | Kafka locally, Event Hubs-compatible settings for Azure | Kafka gives strong local reproducibility and direct visibility into partitions, offsets, and consumer groups |
 | Hot store | PostgreSQL | One operational store is simpler than a Redis plus PostgreSQL split at this stage |
 | Delivery semantics | Idempotent at-least-once | Easier to implement and explain than exactly-once while still demonstrating correctness controls |
-| Cold path | Local NDJSON archive | Supports replay and rebuild without requiring cloud object storage |
+| Cold path | Local NDJSON archive plus Blob-backed archive option | Supports replay and rebuild locally while preserving an Azure durability path |
 | Local deployment | Docker Compose | Faster iteration and lower operational overhead than Kubernetes for the current stage |
 | Replica observability | Prometheus Docker service discovery | Allows local processor scaling evidence without static scrape targets |
+| Poison-message handling | Dedicated Kafka DLQ | Keeps processor-side bad records from blocking the consumer loop |
+| Contract governance | AsyncAPI plus JSON Schema | Kafka topics and payloads are versioned in source control and validated in CI |
 
 ## Data owned by PostgreSQL
 
@@ -156,3 +180,18 @@ Each processor replica writes an instance-scoped heartbeat and metric snapshot i
 - Request tracing is wired in through OpenTelemetry, but trace export is disabled by default for throughput runs.
 - Prometheus scrapes services directly from Docker discovery metadata rather than static target lists.
 - Grafana is provisioned only as a local visualization layer. The query API remains the system-of-record read surface for the dashboard.
+- Processor snapshot payloads carry `dead_letter_total`, active partitions, in-flight message count, and p50/p95/p99 processing latency.
+- The local archive is currently date-partitioned, which is durable enough for MVP replay proof but inefficient for selective tenant replay at large volumes.
+
+## Azure deployment path
+
+The first Azure deployment variant uses:
+
+- Azure Event Hubs as the Kafka endpoint
+- Azure Blob Storage for raw archive durability and replay scanning
+- Azure Container Apps for `ingest-service`, `query-service`, and `stream-processor`
+- Azure Log Analytics through the Container Apps environment
+- system-assigned managed identity on `ingest-service` for Blob access
+- existing PostgreSQL and Event Hubs credentials injected as Container Apps secrets
+
+This path provides a durable Azure replay archive. The main remaining Azure gaps are dashboard deployment parity, infrastructure provisioning for backing services, and published Azure benchmark evidence.

@@ -7,6 +7,7 @@ param(
     [int]$MaxInFlight = 1000,
     [int]$ProcessorReplicas = 1,
     [string]$ComposeFile = "deploy/docker-compose/docker-compose.yml",
+    [string]$BearerToken = "",
     [string]$PrometheusEndpoint = "http://localhost:9090",
     [string]$OutputPath = ""
 )
@@ -15,19 +16,33 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path "$PSScriptRoot/../.."
 $artifactDir = Join-Path $repoRoot "artifacts/failure-drills"
 $benchmarkContainerName = "pulsestream-chaos-producer"
+$defaultBearerToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4iLCJpc3MiOiJwdWxzZXN0cmVhbS1sb2NhbCIsInN1YiI6ImxvY2FsLWFkbWluIiwiYXVkIjpbInB1bHNlc3RyZWFtLWxvY2FsIl0sImV4cCI6MjA5MTI3ODUwNiwiaWF0IjoxNzc1OTE4NTA2fQ.q__74RIQsNpC5AfZY6yr-6dwTAP8gybP2_4kB5NQ-Vs"
 
 New-Item -ItemType Directory -Force $artifactDir | Out-Null
+
+if ([string]::IsNullOrWhiteSpace($BearerToken)) {
+    $BearerToken = $env:PULSESTREAM_BEARER_TOKEN
+}
+if ([string]::IsNullOrWhiteSpace($BearerToken)) {
+    $BearerToken = $defaultBearerToken
+}
 
 function Wait-HttpReady {
     param(
         [string]$Url,
+        [hashtable]$Headers = @{},
         [int]$TimeoutSeconds = 20
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         try {
-            Invoke-WebRequest -Uri $Url -UseBasicParsing | Out-Null
+            if ($Headers.Count -gt 0) {
+                Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing | Out-Null
+            }
+            else {
+                Invoke-WebRequest -Uri $Url -UseBasicParsing | Out-Null
+            }
             return $true
         }
         catch {
@@ -36,6 +51,16 @@ function Wait-HttpReady {
     }
 
     return $false
+}
+
+function Get-AuthHeaders {
+    param([string]$Token)
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return @{}
+    }
+
+    return @{ Authorization = "Bearer $Token" }
 }
 
 function Test-ContainerExists {
@@ -180,9 +205,18 @@ function Wait-PrometheusQueryExactValue {
 }
 
 function Get-Snapshot {
-    param([string]$PrometheusBaseUrl)
+    param(
+        [string]$PrometheusBaseUrl,
+        [string]$Token
+    )
 
-    $overview = Invoke-RestMethod -Uri "http://localhost:8081/api/v1/metrics/overview"
+    $headers = Get-AuthHeaders -Token $Token
+    if ($headers.Count -gt 0) {
+        $overview = Invoke-RestMethod -Uri "http://localhost:8081/api/v1/metrics/overview" -Headers $headers
+    }
+    else {
+        $overview = Invoke-RestMethod -Uri "http://localhost:8081/api/v1/metrics/overview"
+    }
 
     return [pscustomobject]@{
         timestamp_utc      = (Get-Date).ToUniversalTime()
@@ -256,7 +290,7 @@ try {
     if (-not (Wait-HttpReady -Url "$PrometheusEndpoint/-/ready" -TimeoutSeconds 30)) {
         throw "Prometheus did not become ready."
     }
-    if (-not (Wait-HttpReady -Url "http://localhost:8081/api/v1/metrics/overview" -TimeoutSeconds 30)) {
+    if (-not (Wait-HttpReady -Url "http://localhost:8081/api/v1/metrics/overview" -Headers (Get-AuthHeaders -Token $BearerToken) -TimeoutSeconds 30)) {
         throw "Query service overview endpoint did not become ready."
     }
     if (-not (Wait-PrometheusQueryExactValue -BaseUrl $PrometheusEndpoint -Query 'count(up{job="stream-processor"})' -ExpectedValue $ProcessorReplicas -TimeoutSeconds 60)) {
@@ -271,6 +305,7 @@ try {
         --no-deps `
         --service-ports `
         -e SIM_INGEST_ENDPOINT=http://ingest-service:8080/api/v1/events `
+        -e SIM_BEARER_TOKEN=$BearerToken `
         -e SIM_RATE_PER_SEC=$Rate `
         -e SIM_TENANT_COUNT=5 `
         -e SIM_SOURCES_PER_TENANT=25 `
@@ -318,7 +353,7 @@ try {
             $restartCompletedAt = (Get-Date).ToUniversalTime()
         }
 
-        $samples += Get-Snapshot -PrometheusBaseUrl $PrometheusEndpoint
+        $samples += Get-Snapshot -PrometheusBaseUrl $PrometheusEndpoint -Token $BearerToken
         Start-Sleep -Milliseconds $SampleIntervalMilliseconds
     }
 }

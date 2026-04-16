@@ -4,12 +4,12 @@
 
 | Service | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- | --- |
-| `ingest-service` | `POST` | `/api/v1/events` | none in local Compose | Accept one telemetry event |
-| `ingest-service` | `POST` | `/api/v1/admin/replay` | admin token | Replay archived events back into Kafka |
-| `query-service` | `GET` | `/api/v1/metrics/overview` | none in local Compose | Return platform-wide overview metrics |
-| `query-service` | `GET` | `/api/v1/metrics/tenants/{tenantId}` | none in local Compose | Return tenant bucket series |
-| `query-service` | `GET` | `/api/v1/metrics/sources/top` | none in local Compose | Return top sources, optionally filtered by tenant |
-| `query-service` | `GET` | `/api/v1/metrics/rejections` | none in local Compose | Return latest ingest rejections |
+| `ingest-service` | `POST` | `/api/v1/events` | bearer JWT | Accept one telemetry event |
+| `ingest-service` | `POST` | `/api/v1/admin/replay` | admin token or admin bearer JWT | Replay archived events back into Kafka |
+| `query-service` | `GET` | `/api/v1/metrics/overview` | bearer JWT | Return platform-wide overview metrics |
+| `query-service` | `GET` | `/api/v1/metrics/tenants/{tenantId}` | bearer JWT | Return tenant bucket series |
+| `query-service` | `GET` | `/api/v1/metrics/sources/top` | bearer JWT | Return top sources, optionally filtered by tenant |
+| `query-service` | `GET` | `/api/v1/metrics/rejections` | bearer JWT | Return latest ingest rejections |
 | every Go service | `GET` | `/healthz` | none | Liveness probe |
 | every Go service | `GET` | `/readyz` | none | Readiness probe |
 | every Go service | `GET` | `/metrics` | none | Prometheus metrics |
@@ -25,8 +25,6 @@
   "error": "message"
 }
 ```
-
-- The local Compose deployment is intentionally open except for the replay endpoint.
 
 ## Ingest event
 
@@ -84,6 +82,7 @@ Representative response shape:
   "rejected_total": 343,
   "processed_total": 1910754,
   "duplicate_total": 10385,
+  "dead_letter_total": 1,
   "consumer_lag": 0,
   "processor_instances": 3,
   "processor_active_partitions": 3,
@@ -126,7 +125,7 @@ Response shape:
 
 ### `GET /api/v1/metrics/sources/top?tenantId=tenant_01&limit=8`
 
-Returns the most active sources ordered by cumulative event count.
+Returns the most active sources ordered by cumulative event count. `tenant_user` tokens can only read their assigned tenant.
 
 ## Recent rejections
 
@@ -138,12 +137,12 @@ Returns the newest rejection rows recorded by the ingest service.
 
 ### `POST /api/v1/admin/replay`
 
-This endpoint republishes archived events from the raw archive back into Kafka. It is intended for local operator use only.
+This endpoint republishes archived events from the raw archive back into Kafka. It is intended for local operator recovery and replay drills.
 
 Auth headers:
 
 - `X-Admin-Token: pulsestream-dev-admin`
-- or `Authorization: Bearer pulsestream-dev-admin`
+- or `Authorization: Bearer <admin-jwt>`
 
 Request body:
 
@@ -174,6 +173,27 @@ Successful response:
 }
 ```
 
+## Service health and metrics
+
+Each Go service exposes:
+
+- `GET /healthz`
+- `GET /readyz`
+- `GET /metrics`
+
+## Async contract
+
+Kafka message contracts are documented separately from the HTTP APIs:
+
+- [asyncapi.yaml](../asyncapi.yaml) for topic addresses, operations, headers, and examples
+- [telemetry-event-v1.schema.json](../schemas/telemetry-event-v1.schema.json) for the accepted telemetry payload
+- [dead-letter-record-v1.schema.json](../schemas/dead-letter-record-v1.schema.json) for DLQ payloads
+
 ## Authentication scope
 
-The local Compose environment is intentionally unauthenticated for the ingest and query endpoints so benchmarking and failure drills remain straightforward. Tenant authentication and authorization are not implemented yet. The replay endpoint is the only local endpoint that is protected.
+The local stack requires JWT bearer tokens for ingest and query endpoints.
+
+- `admin` tokens can query any tenant and call replay endpoints.
+- `tenant_user` tokens are restricted to their own `tenant_id`.
+- `GET /healthz`, `GET /readyz`, and `GET /metrics` remain unauthenticated.
+- The replay endpoint accepts `Authorization: Bearer <admin-jwt>` and still accepts `X-Admin-Token` for local recovery drills.

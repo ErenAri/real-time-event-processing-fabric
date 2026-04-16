@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "value": "pulsestream"
+    },
+    "ingestImage": {
+      "value": "ghcr.io/your-user/pulsestream-ingest-service:latest"
+    },
+    "queryImage": {
+      "value": "ghcr.io/your-user/pulsestream-query-service:latest"
+    },
+    "processorImage": {
+      "value": "ghcr.io/your-user/pulsestream-stream-processor:latest"
+    },
+    "postgresAppUrl": {
+      "value": "postgres://pulsestream_app:<password>@your-postgres.postgres.database.azure.com:5432/pulsestream?sslmode=require"
+    },
+    "postgresAdminUrl": {
+      "value": "postgres://postgres-admin:<password>@your-postgres.postgres.database.azure.com:5432/pulsestream?sslmode=require"
+    },
+    "eventHubsHost": {
+      "value": "your-namespace.servicebus.windows.net"
+    },
+    "eventHubsConnectionString": {
+      "value": "Endpoint=sb://your-namespace.servicebus.windows.net/;SharedAccessKeyName=pulsestream;SharedAccessKey=<key>"
+    },
+    "blobArchiveAccountUrl": {
+      "value": "https://yourstorageaccount.blob.core.windows.net/"
+    },
+    "blobArchiveContainer": {
+      "value": "raw-archive"
+    },
+    "blobArchivePrefix": {
+      "value": "pulsestream"
+    },
+    "authJwtSecret": {
+      "value": "replace-with-long-random-secret"
+    },
+    "adminToken": {
+      "value": "replace-with-long-random-admin-token"
+    }
+  }
+}

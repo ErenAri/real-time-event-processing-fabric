@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/segmentio/kafka-go"
 
+	"pulsestream/internal/deadletter"
 	"pulsestream/internal/events"
 	"pulsestream/internal/store"
 	"pulsestream/internal/telemetry"
@@ -27,21 +28,30 @@ type eventStore interface {
 	RecordProcessedEvent(ctx context.Context, event events.TelemetryEvent) (bool, error)
 }
 
+type deadLetterPublisher interface {
+	PublishDeadLetter(ctx context.Context, record deadletter.Record) error
+}
+
 type RunnerConfig struct {
 	PartitionQueueCapacity int
+	Brokers                []string
+	ConsumerGroup          string
+	RetryBackoff           time.Duration
 }
 
 type Runner struct {
-	reader messageReader
-	store  eventStore
-	logger *slog.Logger
-	config RunnerConfig
+	reader       messageReader
+	store        eventStore
+	dlqPublisher deadLetterPublisher
+	logger       *slog.Logger
+	config       RunnerConfig
 
 	startedAt time.Time
 	latencies *telemetry.QuantileWindow
 
 	processedTotal   atomic.Int64
 	duplicateTotal   atomic.Int64
+	deadLetterTotal  atomic.Int64
 	consumerLag      atomic.Int64
 	inFlightTotal    atomic.Int64
 	activePartitions atomic.Int64
@@ -50,6 +60,10 @@ type Runner struct {
 
 	processedCounter      prometheus.Counter
 	duplicateCounter      prometheus.Counter
+	deadLetterCounter     *prometheus.CounterVec
+	dlqPublishFailures    prometheus.Counter
+	fetchErrorCounter     prometheus.Counter
+	commitRetryCounter    prometheus.Counter
 	processDuration       prometheus.Histogram
 	consumerLagGauge      prometheus.Gauge
 	inFlightGauge         prometheus.Gauge
@@ -59,6 +73,7 @@ type Runner struct {
 func NewRunner(
 	reader messageReader,
 	store eventStore,
+	dlqPublisher deadLetterPublisher,
 	logger *slog.Logger,
 	registry *prometheus.Registry,
 	config RunnerConfig,
@@ -66,14 +81,18 @@ func NewRunner(
 	if config.PartitionQueueCapacity <= 0 {
 		config.PartitionQueueCapacity = 256
 	}
+	if config.RetryBackoff <= 0 {
+		config.RetryBackoff = time.Second
+	}
 
 	runner := &Runner{
-		reader:    reader,
-		store:     store,
-		logger:    logger,
-		config:    config,
-		startedAt: time.Now().UTC(),
-		latencies: telemetry.NewQuantileWindow(4096),
+		reader:       reader,
+		store:        store,
+		dlqPublisher: dlqPublisher,
+		logger:       logger,
+		config:       config,
+		startedAt:    time.Now().UTC(),
+		latencies:    telemetry.NewQuantileWindow(4096),
 		processedCounter: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pulsestream_processor_processed_total",
 			Help: "Number of processed events written to the hot store.",
@@ -81,6 +100,22 @@ func NewRunner(
 		duplicateCounter: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pulsestream_processor_duplicate_total",
 			Help: "Number of duplicate events discarded by the processor.",
+		}),
+		deadLetterCounter: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pulsestream_processor_dead_letter_total",
+			Help: "Number of poison messages written to the dead-letter topic.",
+		}, []string{"reason"}),
+		dlqPublishFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pulsestream_processor_dead_letter_publish_failures_total",
+			Help: "Number of dead-letter publish attempts that failed.",
+		}),
+		fetchErrorCounter: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pulsestream_processor_fetch_errors_total",
+			Help: "Number of Kafka fetch attempts that failed and were retried.",
+		}),
+		commitRetryCounter: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pulsestream_processor_commit_retries_total",
+			Help: "Number of Kafka commit attempts that failed and were retried.",
 		}),
 		processDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "pulsestream_processor_duration_seconds",
@@ -104,6 +139,10 @@ func NewRunner(
 	registry.MustRegister(
 		runner.processedCounter,
 		runner.duplicateCounter,
+		runner.deadLetterCounter,
+		runner.dlqPublishFailures,
+		runner.fetchErrorCounter,
+		runner.commitRetryCounter,
 		runner.processDuration,
 		runner.consumerLagGauge,
 		runner.inFlightGauge,
@@ -162,8 +201,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			if ctx.Err() != nil || runCtx.Err() != nil {
 				break
 			}
-			fetchErr = fmt.Errorf("fetch kafka message: %w", err)
-			break
+			r.fetchErrorCounter.Inc()
+			r.logger.Warn("fetch_message_failed_retrying", "error", err, "backoff", r.config.RetryBackoff.String())
+			if !sleepWithContext(runCtx, r.config.RetryBackoff) {
+				break
+			}
+			continue
 		}
 
 		lag := r.reader.Stats().Lag
@@ -214,6 +257,7 @@ func (r *Runner) Snapshot() store.ProcessorState {
 	return store.ProcessorState{
 		ProcessedTotal:   r.processedTotal.Load(),
 		DuplicateTotal:   r.duplicateTotal.Load(),
+		DeadLetterTotal:  r.deadLetterTotal.Load(),
 		ConsumerLag:      r.consumerLag.Load(),
 		ActivePartitions: r.activePartitions.Load(),
 		InFlightMessages: r.inFlightTotal.Load(),
@@ -232,14 +276,20 @@ func (r *Runner) handleMessage(ctx context.Context, message kafka.Message) error
 		return nil
 	}
 
-	event, err := decode(message.Value)
+	ctx, span := telemetry.StartKafkaProcessSpan(ctx, message, r.config.ConsumerGroup, r.config.Brokers)
+	defer span.End()
+
+	event, reason, err := decode(message.Value)
 	if err != nil {
-		r.logger.Error("decode_message_failed", "error", err)
-		if err := r.commitMessage(ctx, message); err != nil {
-			return fmt.Errorf("commit malformed message: %w", err)
+		telemetry.SetKafkaMessageID(span, event.EventID)
+		telemetry.RecordSpanError(span, err)
+		if err := r.deadLetterMessage(ctx, message, event, reason, err); err != nil {
+			telemetry.RecordSpanError(span, err)
+			return err
 		}
 		return nil
 	}
+	telemetry.SetKafkaMessageID(span, event.EventID)
 
 	start := time.Now()
 	recorded, err := r.store.RecordProcessedEvent(ctx, event)
@@ -247,6 +297,7 @@ func (r *Runner) handleMessage(ctx context.Context, message kafka.Message) error
 		if ctx.Err() != nil {
 			return nil
 		}
+		telemetry.RecordSpanError(span, err)
 		return fmt.Errorf("record processed event: %w", err)
 	}
 
@@ -262,22 +313,92 @@ func (r *Runner) handleMessage(ctx context.Context, message kafka.Message) error
 	}
 
 	if err := r.commitMessage(ctx, message); err != nil {
+		telemetry.RecordSpanError(span, err)
 		return fmt.Errorf("commit message: %w", err)
 	}
 	return nil
 }
 
-func (r *Runner) commitMessage(ctx context.Context, message kafka.Message) error {
-	r.commitMu.Lock()
-	defer r.commitMu.Unlock()
+func (r *Runner) deadLetterMessage(
+	ctx context.Context,
+	message kafka.Message,
+	event events.TelemetryEvent,
+	reason string,
+	processErr error,
+) error {
+	if reason == "" {
+		reason = "invalid_message"
+	}
+	if r.dlqPublisher == nil {
+		return fmt.Errorf("dead-letter publisher is not configured for %s", reason)
+	}
 
-	if err := r.reader.CommitMessages(ctx, message); err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
-		return err
+	record := deadletter.NewRecord(
+		message,
+		r.config.ConsumerGroup,
+		reason,
+		processErr,
+		event.EventID,
+		event.TenantID,
+		event.SourceID,
+	)
+	if err := r.dlqPublisher.PublishDeadLetter(ctx, record); err != nil {
+		r.dlqPublishFailures.Inc()
+		return fmt.Errorf("publish dead-letter message: %w", err)
+	}
+
+	r.deadLetterCounter.WithLabelValues(reason).Inc()
+	r.deadLetterTotal.Add(1)
+	r.logger.Warn(
+		"message_dead_lettered",
+		"reason", reason,
+		"error", processErr,
+		"topic", message.Topic,
+		"partition", message.Partition,
+		"offset", message.Offset,
+		"tenant_id", event.TenantID,
+		"source_id", event.SourceID,
+		"event_id", event.EventID,
+	)
+
+	if err := r.commitMessage(ctx, message); err != nil {
+		return fmt.Errorf("commit dead-lettered message: %w", err)
 	}
 	return nil
+}
+
+func (r *Runner) commitMessage(ctx context.Context, message kafka.Message) error {
+	for {
+		commitCtx, span := telemetry.StartKafkaCommitSpan(ctx, message, r.config.ConsumerGroup, r.config.Brokers)
+
+		r.commitMu.Lock()
+		err := r.reader.CommitMessages(commitCtx, message)
+		r.commitMu.Unlock()
+
+		if err == nil {
+			span.End()
+			return nil
+		}
+		if ctx.Err() != nil {
+			span.End()
+			return nil
+		}
+
+		telemetry.RecordSpanError(span, err)
+		span.End()
+		r.commitRetryCounter.Inc()
+		r.logger.Warn(
+			"commit_message_failed_retrying",
+			"error", err,
+			"topic", message.Topic,
+			"partition", message.Partition,
+			"offset", message.Offset,
+			"backoff", r.config.RetryBackoff.String(),
+		)
+		if !sleepWithContext(ctx, r.config.RetryBackoff) {
+			return nil
+		}
+	}
 }
 
 func (r *Runner) addInFlight(delta int64) {
@@ -290,10 +411,33 @@ func (r *Runner) addActivePartitions(delta int64) {
 	r.activePartitionsGauge.Set(float64(total))
 }
 
-func decode(payload []byte) (events.TelemetryEvent, error) {
-	var event events.TelemetryEvent
-	if err := json.Unmarshal(payload, &event); err != nil {
-		return events.TelemetryEvent{}, err
+func decode(payload []byte) (events.TelemetryEvent, string, error) {
+	event, err := events.DecodeTelemetryEvent(payload)
+	if err == nil {
+		if validationErr := event.Validate(); validationErr != nil {
+			return event, "validation_failed", validationErr
+		}
+		return event, "", nil
 	}
-	return event, event.Validate()
+
+	var partial events.TelemetryEvent
+	if unmarshalErr := json.Unmarshal(payload, &partial); unmarshalErr == nil {
+		if validationErr := partial.Validate(); validationErr != nil {
+			return partial, "validation_failed", validationErr
+		}
+	}
+
+	return partial, "decode_failed", err
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

@@ -62,6 +62,7 @@ The harness:
 - runs a one-off producer container inside the Docker network
 - samples `GET /api/v1/metrics/overview`
 - reads ingest and processor counters through Prometheus instant queries
+- records requested and observed processor replica counts
 
 ## Metrics captured
 
@@ -90,6 +91,7 @@ The harness:
 - The current scale-aware comparison shows a modest but real gain from `3` processor replicas relative to `1` replica under the same benchmark harness.
 - The latest pair should be read carefully: the producer path only sustained about `700-860 eps`, so processor scaling is no longer the only limiting factor in that profile.
 - Query latency remained low in all recent artifacts, which supports the claim that hot-view reads remain cheap under concurrent write load.
+- Poison-message handling is verified separately in `artifacts/failure-drills/inject-poison-message-20260411-152328.json` so malformed direct-to-Kafka records can be tested without distorting the hot benchmark stream.
 
 ## Current bottleneck
 

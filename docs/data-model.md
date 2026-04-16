@@ -29,7 +29,7 @@
 | `status` | one of `ok`, `warn`, `error` |
 | `value` | numeric |
 
-The formal JSON Schema is in [schemas/telemetry-event-v1.schema.json](/C:/Projects/real-time-event-processing-fabric/schemas/telemetry-event-v1.schema.json).
+The formal JSON Schema is in [schemas/telemetry-event-v1.schema.json](../schemas/telemetry-event-v1.schema.json). The Kafka topic contract that references this schema is in [asyncapi.yaml](../asyncapi.yaml).
 
 ## Storage model
 
@@ -83,7 +83,7 @@ erDiagram
 
 | Table | Purpose |
 | --- | --- |
-| `processed_events` | Deduplication guard keyed by `event_id` |
+| `processed_events` | Deduplication guard keyed by `event_id`; duplicate inserts skip aggregate updates |
 | `tenant_metrics` | 10-second aggregate buckets used for throughput and status charts |
 | `source_metrics` | Per-tenant cumulative source counters used for top-source queries |
 | `rejection_events` | Records ingest validation failures and publish failures |
@@ -91,7 +91,7 @@ erDiagram
 
 ## Raw archive
 
-Accepted events are written to an immutable NDJSON archive partitioned by UTC day.
+Accepted events are written to an immutable archive partitioned by UTC day.
 
 ```text
 RAW_ARCHIVE_DIR/
@@ -107,10 +107,34 @@ Each line contains:
 - the decoded `event`
 - the original `raw_payload`
 
-The raw archive provides the cold path for replay and hot-view rebuilds.
+The raw archive provides the cold path for replay and hot-view rebuilds. The local archive uses NDJSON files; the Azure variant can use Blob Storage through the archive abstraction.
+
+## Dead-letter records
+
+`pulsestream.events.dlq` stores processor-side poison messages that were already present in Kafka but could not be decoded or validated by the consumer. Each record includes:
+
+- failure timestamp
+- failure reason
+- error string
+- source topic, partition, and offset
+- consumer group
+- optional event metadata when it could be recovered
+- base64-encoded original payload
+- base64-encoded Kafka headers
+
+The formal JSON Schema for this payload is in [schemas/dead-letter-record-v1.schema.json](../schemas/dead-letter-record-v1.schema.json).
 
 ## Service state semantics
 
 The `service_state` table uses `service_name + instance_id` as its key. This allows multiple processor replicas to report independently without overwriting each other.
 
 The query layer ignores stale rows so that stopped or replaced replicas do not continue to count as live capacity.
+
+Processor snapshot payloads carry:
+
+- `dead_letter_total`
+- `active_partitions`
+- `inflight_messages`
+- `processing_p50_ms`
+- `processing_p95_ms`
+- `processing_p99_ms`

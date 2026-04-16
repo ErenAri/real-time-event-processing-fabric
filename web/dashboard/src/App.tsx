@@ -34,6 +34,7 @@ const emptyOverview: Overview = {
   rejected_total: 0,
   processed_total: 0,
   duplicate_total: 0,
+  dead_letter_total: 0,
   consumer_lag: 0,
   processor_instances: 0,
   processor_active_partitions: 0,
@@ -168,12 +169,12 @@ export default function App() {
         <MetricCard
           label="Processed"
           value={formatNumber(overview.processed_total)}
-          detail={`Duplicates ${formatNumber(overview.duplicate_total)} / Replicas ${formatNumber(overview.processor_instances)}`}
+          detail={`Duplicates ${formatNumber(overview.duplicate_total)} / Dead-lettered ${formatNumber(overview.dead_letter_total)}`}
         />
         <MetricCard
           label="Throughput"
           value={`${formatNumber(overview.events_per_second_last_minute, 1)} eps`}
-          detail={`Error rate ${formatPercent(overview.error_rate_last_minute)}`}
+          detail={`Error rate ${formatPercent(overview.error_rate_last_minute)} / Replicas ${formatNumber(overview.processor_instances)}`}
         />
         <MetricCard
           label="Consumer lag"
@@ -235,6 +236,10 @@ export default function App() {
             <div>
               <dt>Processor replicas</dt>
               <dd>{formatNumber(overview.processor_instances)}</dd>
+            </div>
+            <div>
+              <dt>Dead-lettered</dt>
+              <dd>{formatNumber(overview.dead_letter_total)}</dd>
             </div>
             <div>
               <dt>Active partitions</dt>

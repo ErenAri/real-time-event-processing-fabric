@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"pulsestream/internal/api"
+	"pulsestream/internal/auth"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
 	"pulsestream/internal/telemetry"
@@ -35,22 +37,34 @@ func run() error {
 
 	listenAddr := platform.EnvString("QUERY_LISTEN_ADDR", ":8081")
 	postgresURL := platform.EnvString("POSTGRES_URL", "postgres://postgres:postgres@localhost:5432/pulsestream?sslmode=disable")
+	postgresAdminURL := platform.EnvString("POSTGRES_ADMIN_URL", "")
+	jwtSecret := platform.EnvString("AUTH_JWT_SECRET", "")
+	jwtIssuer := platform.EnvString("AUTH_JWT_ISSUER", "")
+	jwtAudience := platform.EnvString("AUTH_JWT_AUDIENCE", "")
 	instanceID := platform.EnvInstanceID("SERVICE_INSTANCE_ID", "query-service")
 	snapshotInterval, err := platform.EnvDuration("QUERY_SNAPSHOT_INTERVAL", 5*time.Second)
 	if err != nil {
 		return err
 	}
 
-	storage, err := store.New(ctx, postgresURL)
+	storage, err := store.NewWithAdmin(ctx, postgresURL, postgresAdminURL)
 	if err != nil {
 		return err
 	}
 	defer storage.Close()
 
+	var verifier *auth.Verifier
+	if strings.TrimSpace(jwtSecret) != "" {
+		verifier, err = auth.NewVerifier(jwtSecret, jwtIssuer, jwtAudience)
+		if err != nil {
+			return err
+		}
+	}
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 
-	handler := api.NewQueryHandler(logger, storage, registry)
+	handler := api.NewQueryHandler(logger, storage, verifier, registry)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
