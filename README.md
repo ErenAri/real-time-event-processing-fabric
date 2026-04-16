@@ -149,7 +149,7 @@ graph TD
 
 - Throughput target: `5k events/sec` sustained for the MVP benchmark gate
 - Dashboard freshness target: under `2s`
-- Failure proofs: processor restart, duplicate handling, malformed burst handling, broker outage handling, PostgreSQL slowdown drill
+- Failure proofs: processor restart, duplicate handling, malformed burst handling, broker outage handling, PostgreSQL slowdown drill, archive replay and hot-view rebuild
 - Docs and runbooks: see the files under [`docs/`](docs)
 
 ## Status
@@ -160,7 +160,11 @@ Current benchmark evidence shows the ingest path sustaining roughly `1.2k accept
  
 Poison-message handling is now verified in the scripted drill artifact `artifacts/failure-drills/inject-poison-message-20260411-152328.json`: a malformed record written directly to `pulsestream.events` was consumed by a fresh-group processor, published to `pulsestream.events.dlq`, and surfaced through `dead_letter_total` in the overview API.
 
-Broker-outage handling is now materially stronger in the verified artifact `artifacts/failure-drills/broker-outage-20260412-200340.json`: with an `800 eps` target load and a `12s` Kafka outage, the processor stayed alive and retried fetches instead of crashing, ingest recorded `5,767` explicit `publish_failed` rejections, the raw archive delta remained nearly balanced with the accepted-plus-rejected totals, and recovery returned within the drill window. A follow-up rerun after the ingest backpressure change exposed a timeout in the drill's Kafka-health wait rather than a new application fault, so the current published outage evidence remains the `20260412-200340` artifact.
+Broker-outage handling is now verified in `artifacts/failure-drills/broker-outage-20260416-201249.json`: with an `800 eps` target load and a `12s` Kafka outage, the processor stayed alive, Kafka health was detected during the run, accepted traffic recovered within the observation window, and raw-archive accounting closed with a `0` event gap. The run recorded `2,980` explicit `publish_failed` rejections and `19,100` explicit `backpressure` rejections. The remaining gap is that the producer log still contained `278` client-side timeouts, so ingest overload behavior is improved but not fully clean yet.
+
+PostgreSQL pause handling is now verified in `artifacts/failure-drills/pause-postgres-20260416-202040.json`: with an `800 eps` target load and a `12s` Postgres pause, ingest accepted and archived `26,195` events, query overview calls failed visibly while the dependency was paused, processor in-flight peaked at `485`, and processing resumed `1.24s` after Postgres reported healthy. The remaining gap is elevated final consumer lag and a small number of producer-side timeouts during the DB stall.
+
+Archive replay and hot-view rebuild are now verified in `artifacts/failure-drills/replay-archive-20260416173251.json`: the drill created a sentinel tenant with `25` accepted events, replayed the archived events once, observed `25` duplicate discards with `0` source-metric overcount, reset only the sentinel tenant's hot-view and dedup rows, replayed again, and rebuilt the processed-event and source-metric counts back to `25`. The remaining gap is replay efficiency: the current date-partitioned flat-file archive scanned `498,706` records to replay `25`, so production-scale replay needs tenant/time indexing or object-prefix partitioning.
 
 ## Admin replay
 
@@ -173,4 +177,10 @@ Invoke-RestMethod `
   -Headers @{ "X-Admin-Token" = "pulsestream-dev-admin" } `
   -ContentType "application/json" `
   -Body '{"start_date":"2026-04-10","tenant_id":"tenant_01","limit":500}'
+```
+
+For a repeatable proof that replay is duplicate-safe and can rebuild hot views for a scoped tenant, run:
+
+```powershell
+./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 90
 ```

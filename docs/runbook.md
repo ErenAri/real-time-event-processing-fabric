@@ -41,6 +41,14 @@ Invoke-RestMethod `
 
 The archive is stored in the ingest container at `/var/lib/pulsestream/archive` and on the host via the `archive-data` Docker volume.
 
+Use the scripted replay drill when you need repeatable evidence that replay is duplicate-safe and can rebuild scoped hot views:
+
+```powershell
+./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 90
+```
+
+The drill creates a unique sentinel tenant, verifies the first replay is discarded as duplicates without aggregate overcounting, deletes only the sentinel tenant's hot-view and dedup rows, replays again, and writes an artifact under `artifacts/failure-drills/`.
+
 ## Investigate lag
 
 1. Check `pulsestream_processor_consumer_lag` in Prometheus.
@@ -78,3 +86,4 @@ docker exec docker-compose-kafka-1 sh -lc `
 - Restart processor: `./scripts/chaos/restart-processor.ps1`
 - Inject poison message: `./scripts/chaos/inject-poison-message.ps1`
 - Pause Postgres: `./scripts/chaos/pause-postgres.ps1`
+- Replay archive and rebuild hot views: `./scripts/chaos/replay-archive.ps1`

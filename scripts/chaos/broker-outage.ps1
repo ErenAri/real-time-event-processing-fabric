@@ -136,6 +136,27 @@ function Wait-ComposeServiceReplicas {
     return @()
 }
 
+function Test-ComposeServiceReady {
+    param(
+        [string]$ComposeFilePath,
+        [string]$Service
+    )
+
+    $containerIds = @(Get-ComposeServiceContainerIds -ComposeFilePath $ComposeFilePath -Service $Service)
+    if ($containerIds.Count -eq 0) {
+        return $false
+    }
+
+    foreach ($containerId in $containerIds) {
+        $status = Get-ContainerHealthStatus -ContainerId $containerId
+        if ($status -ne "healthy" -and $status -ne "running") {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Get-PrometheusInstantValue {
     param(
         [string]$BaseUrl,
@@ -201,6 +222,7 @@ function Get-Snapshot {
         accepted_total           = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "sum(pulsestream_ingest_accepted_total)")
         rejected_total           = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "sum(pulsestream_ingest_rejected_total)")
         publish_failed_total     = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query 'sum(pulsestream_ingest_rejected_total{reason="publish_failed"})')
+        backpressure_total       = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query 'sum(pulsestream_ingest_rejected_total{reason="backpressure"})')
         processed_total          = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "sum(pulsestream_processor_processed_total)")
         consumer_lag             = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "sum(pulsestream_processor_consumer_lag)")
         processor_replicas       = [int](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query 'count(up{job="stream-processor"})')
@@ -239,6 +261,7 @@ $originalProcessorReplicas = @(Get-ComposeServiceContainerIds -ComposeFilePath $
 $brokerOutageStartedAt = $null
 $brokerOutageEndedAt = $null
 $brokerReadyAt = $null
+$brokerRecoveryTimedOut = $false
 
 try {
     if (@(Get-ComposeServiceContainerIds -ComposeFilePath $ComposeFile -Service "producer-simulator").Count -gt 0) {
@@ -329,12 +352,17 @@ try {
             if ($LASTEXITCODE -ne 0) {
                 throw "Failed to restart kafka."
             }
+        }
 
-            $kafkaContainers = @(Wait-ComposeServiceReplicas -ComposeFilePath $ComposeFile -Service "kafka" -ExpectedCount 1 -TimeoutSeconds $BrokerRecoveryTimeoutSeconds)
-            if ($kafkaContainers.Count -ne 1) {
-                throw "Timed out waiting for kafka to become healthy."
+        if ($brokerRestarted -and $null -eq $brokerReadyAt -and -not $brokerRecoveryTimedOut) {
+            if (Test-ComposeServiceReady -ComposeFilePath $ComposeFile -Service "kafka") {
+                $brokerReadyAt = (Get-Date).ToUniversalTime()
+                Write-Host "Kafka reported healthy after the outage window."
             }
-            $brokerReadyAt = (Get-Date).ToUniversalTime()
+            elseif (($now - $brokerOutageEndedAt.ToLocalTime()).TotalSeconds -ge $BrokerRecoveryTimeoutSeconds) {
+                $brokerRecoveryTimedOut = $true
+                Write-Warning "Kafka did not become healthy within $BrokerRecoveryTimeoutSeconds seconds; continuing so the drill still emits an artifact."
+            }
         }
 
         $samples += Get-Snapshot -PrometheusBaseUrl $PrometheusEndpoint -Token $BearerToken
@@ -402,6 +430,7 @@ $archivedDelta = Get-MonotonicDelta -Values @($samples | ForEach-Object { [doubl
 $acceptedDelta = Get-MonotonicDelta -Values @($samples | ForEach-Object { [double]$_.accepted_total })
 $rejectedDelta = Get-MonotonicDelta -Values @($samples | ForEach-Object { [double]$_.rejected_total })
 $publishFailedDelta = Get-MonotonicDelta -Values @($samples | ForEach-Object { [double]$_.publish_failed_total })
+$backpressureDelta = Get-MonotonicDelta -Values @($samples | ForEach-Object { [double]$_.backpressure_total })
 $processedDelta = Get-MonotonicDelta -Values @($samples | ForEach-Object { [double]$_.processed_total })
 $archivedNotAcceptedDelta = $archivedDelta - $acceptedDelta
 $archiveAccountingGap = $archivedDelta - $acceptedDelta - $publishFailedDelta
@@ -429,9 +458,11 @@ $report = [ordered]@{
     duration_seconds              = $DurationSeconds
     outage_after_seconds          = $OutageAfterSeconds
     outage_seconds                = $OutageSeconds
+    broker_recovery_timeout_seconds = $BrokerRecoveryTimeoutSeconds
     broker_outage_started_at_utc  = $brokerOutageStartedAt
     broker_outage_ended_at_utc    = $brokerOutageEndedAt
     broker_ready_at_utc           = $brokerReadyAt
+    broker_recovery_timed_out     = $brokerRecoveryTimedOut
     accepted_recovered_at_utc     = $acceptedRecoveredAt
     accepted_recovered_within_window = ($null -ne $acceptedRecoveredAt)
     accepted_recovery_seconds     = if ($null -ne $acceptedRecoveredAt -and $null -ne $brokerReadyAt) { [Math]::Round(($acceptedRecoveredAt - $brokerReadyAt).TotalSeconds, 2) } else { $null }
@@ -441,6 +472,7 @@ $report = [ordered]@{
     accepted_total_delta          = $acceptedDelta
     rejected_total_delta          = $rejectedDelta
     publish_failed_total_delta    = $publishFailedDelta
+    backpressure_total_delta      = $backpressureDelta
     processed_total_delta         = $processedDelta
     archived_not_accepted_delta   = $archivedNotAcceptedDelta
     archive_accounting_gap        = $archiveAccountingGap
@@ -464,6 +496,7 @@ Write-Host "Failure drill report written to $OutputPath"
 Write-Host ("Archived delta        : {0}" -f $report.archived_total_delta)
 Write-Host ("Accepted delta        : {0}" -f $report.accepted_total_delta)
 Write-Host ("Publish failed delta  : {0}" -f $report.publish_failed_total_delta)
+Write-Host ("Backpressure delta    : {0}" -f $report.backpressure_total_delta)
 Write-Host ("Accounting gap        : {0}" -f $report.archive_accounting_gap)
 Write-Host ("Peak lag              : {0}" -f $report.peak_consumer_lag)
 Write-Host ("Recovered in window   : {0}" -f $report.accepted_recovered_within_window)

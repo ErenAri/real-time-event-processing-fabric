@@ -44,7 +44,13 @@
 
 - Trigger: `./scripts/chaos/pause-postgres.ps1`
 - Expected behavior: processor errors become visible quickly, read paths degrade, recovery begins when Postgres resumes
-- Evidence to capture: service logs, dashboard state, and recovery time after unpause
+- Observed drill: `artifacts/failure-drills/pause-postgres-20260416-202040.json`
+- Observed behavior: with an `800 eps` target load and a `12s` Postgres pause, ingest accepted `26,195` events and archived the same number of events while Postgres was unavailable
+- Observed behavior: processor progress slowed but recovered inside the observation window; `processed_total_delta` was `19,275`, `peak_processor_inflight` was `485`, and processing resumed `1.24s` after Postgres reported healthy
+- Observed behavior: query-service overview calls failed visibly during the pause; the drill recorded `3` overview failures and a peak overview latency of `3021.87ms`
+- Observed behavior: the ingest backpressure gate recorded `875` rejections, `publish_failed` remained `0`, and `p95` / `p99` processor latency peaked at `23ms` / `45ms`
+- Remaining gap: the producer log still contained `14` client-side timeouts and the final consumer lag remained elevated at `181,976`, so recovery mechanics work but the system still needs stronger drain capacity and cleaner overload behavior under DB stalls
+- Interpretation: Postgres dependency failure is now measured instead of assumed; the hot-view write path degrades, read APIs surface the dependency failure, ingest preserves valid events through the archive and Kafka path, and processor recovery resumes after the database returns
 
 ## Broker outage
 
@@ -56,11 +62,20 @@
 - Observed drill after processor retry hardening: `artifacts/failure-drills/broker-outage-20260412-200340.json`
 - Observed behavior after hardening: the archive delta increased by `26,160`, accepted traffic increased by `20,391`, explicit `publish_failed` rejections increased by `5,767`, and the accounting gap dropped to `2`
 - Observed behavior after hardening: the processor stayed live and emitted `fetch_message_failed_retrying` warnings instead of exiting, accepted traffic recovered within the drill window, and `p95` / `p99` processing latency peaked at `47ms` / `143ms`
-- Interpretation: broker outage handling is now materially stronger because the consumer no longer crashes on broker loss and the ingest path surfaces nearly all failed publishes explicitly; the remaining gap is tightening overload behavior at the ingest edge so client timeouts disappear under sustained broker loss
-- Current code now includes an explicit ingest in-flight backpressure gate, but the first rerun after that change hit a timeout in the drill's Kafka-health wait and did not produce a publishable artifact
+- Observed drill after ingest backpressure and drill-harness hardening: `artifacts/failure-drills/broker-outage-20260416-201249.json`
+- Observed behavior after backpressure: with the same `800 eps` target and `12s` outage, the archive delta was `15,657`, accepted traffic increased by `12,677`, explicit `publish_failed` rejections increased by `2,980`, explicit `backpressure` rejections increased by `19,100`, and the archive accounting gap was `0`
+- Observed behavior after backpressure: Kafka health was detected during the run, accepted traffic recovered inside the observation window, `p95` / `p99` processing latency peaked at `17ms` / `32ms`, and the processor remained live
+- Remaining gap: the producer log for the post-backpressure run still contained `278` client-side timeouts, so overload behavior is more explicit but not fully clean under sustained broker loss
+- Interpretation: broker outage handling is now materially stronger because the consumer no longer crashes on broker loss, failed publishes are counted explicitly, and the ingest service now sheds excess work via `backpressure` instead of allowing all requests to queue
 
 ## Replay and rebuild
 
-- Trigger: `POST /api/v1/admin/replay`
-- Expected behavior: archived events are republished to Kafka, duplicates are safely ignored by the processor, and hot views can be rebuilt
-- Evidence to capture: replay counts, duplicate counts, and post-replay aggregate correctness
+- Trigger: `./scripts/chaos/replay-archive.ps1`
+- Direct endpoint: `POST /api/v1/admin/replay`
+- Expected behavior: archived events are republished to Kafka, duplicates are safely ignored by the processor, and hot views can be rebuilt from the raw archive after scoped state loss
+- Observed drill: `artifacts/failure-drills/replay-archive-20260416173251.json`
+- Observed behavior: the drill paused the compose simulator, started a temporary processor with a fresh consumer group, created a sentinel tenant with `25` accepted events, and waited until the sentinel events were processed into `processed_events` and `source_metrics`
+- Observed behavior: replaying the same tenant/date archive returned `25` replayed records; the verifier processor recorded `25` duplicate discards, `processed_events` stayed at `25`, `source_metrics` stayed at `25`, and `source_metric_overcount_delta` remained `0`
+- Observed behavior: after deleting only the sentinel tenant's `source_metrics`, `tenant_metrics`, and `processed_events` rows, replay returned `25` records again and rebuilt both `processed_events` and `source_metrics` back to `25`
+- Remaining gap: the local flat-file archive is partitioned by date only; the drill scanned `498,706` records and skipped `498,681` to replay `25`, so large replay workloads need tenant/time indexing or object-prefix partitioning before this is efficient at production scale
+- Interpretation: the system now has measured evidence for idempotent replay and scoped hot-view rebuild, but the archive layout is still optimized for MVP durability rather than high-selectivity replay performance
