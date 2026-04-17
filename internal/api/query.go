@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"pulsestream/internal/auth"
+	"pulsestream/internal/evidence"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
 )
@@ -27,6 +28,7 @@ type QueryHandler struct {
 	logger        *slog.Logger
 	reader        MetricsReader
 	verifier      *auth.Verifier
+	evidencePath  string
 	startedAt     time.Time
 	requestsTotal atomic.Int64
 
@@ -36,9 +38,13 @@ type QueryHandler struct {
 
 func NewQueryHandler(logger *slog.Logger, reader MetricsReader, verifier *auth.Verifier, registry *prometheus.Registry) *QueryHandler {
 	handler := &QueryHandler{
-		logger:    logger,
-		reader:    reader,
-		verifier:  verifier,
+		logger:   logger,
+		reader:   reader,
+		verifier: verifier,
+		evidencePath: platform.EnvString(
+			"EVIDENCE_REPORT_PATH",
+			"artifacts/evidence/latest.json",
+		),
 		startedAt: time.Now().UTC(),
 		queryLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "pulsestream_query_request_duration_seconds",
@@ -59,6 +65,7 @@ func (h *QueryHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/metrics/tenants/", h.wrap(h.handleTenantSeries))
 	mux.HandleFunc("/api/v1/metrics/sources/top", h.wrap(h.handleTopSources))
 	mux.HandleFunc("/api/v1/metrics/rejections", h.wrap(h.handleRejections))
+	mux.HandleFunc("/api/v1/evidence/latest", h.wrap(h.handleEvidenceLatest))
 }
 
 func (h *QueryHandler) Snapshot() store.QueryState {
@@ -197,6 +204,25 @@ func (h *QueryHandler) handleRejections(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{"rejections": ensureRecentRejections(rejections)})
+}
+
+func (h *QueryHandler) handleEvidenceLatest(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+	if principal.Role != auth.RoleAdmin {
+		platform.WriteError(w, http.StatusForbidden, "admin role is required")
+		return
+	}
+
+	summary, err := evidence.LoadSummary(h.evidencePath)
+	if err != nil {
+		h.logger.Error("evidence_summary_load_failed", "error", err, "path", h.evidencePath)
+		platform.WriteError(w, http.StatusInternalServerError, "failed to load evidence summary")
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, summary)
 }
 
 func (h *QueryHandler) authenticateRequest(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {

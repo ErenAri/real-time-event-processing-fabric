@@ -308,6 +308,9 @@ func (h *IngestHandler) handleReplay(w http.ResponseWriter, r *http.Request) {
 func (h *IngestHandler) reject(ctx context.Context, payload []byte, tenantID string, sourceID string, reason string) {
 	h.rejectedCounters.WithLabelValues(reason).Inc()
 	h.rejectedTotal.Add(1)
+	if !shouldPersistRejection(reason) {
+		return
+	}
 	if h.rejectionStore == nil {
 		return
 	}
@@ -324,6 +327,15 @@ func (h *IngestHandler) reject(ctx context.Context, payload []byte, tenantID str
 	}
 	if err := h.rejectionStore.RecordRejection(ctx, record); err != nil && !errors.Is(err, context.Canceled) {
 		h.logger.Error("record_rejection_failed", "error", err, "reason", reason)
+	}
+}
+
+func shouldPersistRejection(reason string) bool {
+	switch reason {
+	case "backpressure":
+		return false
+	default:
+		return true
 	}
 }
 

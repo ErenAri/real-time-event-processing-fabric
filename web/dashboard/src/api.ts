@@ -1,12 +1,17 @@
 import type {
+  EvidenceSummary,
   Overview,
   RejectionsResponse,
+  ReplayRequest,
+  ReplayResponse,
   SourcesResponse,
   TenantSeriesResponse,
 } from "./types";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8081";
+const INGEST_API_BASE_URL =
+  import.meta.env.VITE_INGEST_API_BASE_URL ?? "http://localhost:8080";
 const API_BEARER_TOKEN =
   import.meta.env.VITE_API_BEARER_TOKEN?.trim() ?? "";
 
@@ -20,11 +25,31 @@ function buildHeaders(): HeadersInit {
 }
 
 async function fetchJSON<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  return requestJSON<T>(`${API_BASE_URL}${path}`, {
     headers: buildHeaders(),
   });
+}
+
+async function requestJSON<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(buildHeaders());
+  if (init.headers) {
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  }
+  const response = await fetch(url, {
+    ...init,
+    headers,
+  });
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const payload = (await response.json()) as { error?: string };
+      if (payload.error) {
+        detail = `${detail}: ${payload.error}`;
+      }
+    } catch {
+      // Keep the HTTP status as the useful fallback.
+    }
+    throw new Error(detail);
   }
   return (await response.json()) as T;
 }
@@ -122,4 +147,98 @@ export async function fetchRejections(limit = 10) {
       created_at: asString(item?.created_at),
     })),
   };
+}
+
+function normalizeReplayResponse(payload: ReplayResponse): ReplayResponse {
+  const replay = payload?.replay ?? {
+    start_date: "",
+    end_date: "",
+    tenant_id: "",
+    files_read: 0,
+    scanned: 0,
+    skipped: 0,
+    replayed: 0,
+    completed_at: "",
+  };
+  return {
+    status: asString(payload?.status, "unknown"),
+    replay: {
+      start_date: asString(replay.start_date),
+      end_date: asString(replay.end_date),
+      tenant_id: asString(replay.tenant_id),
+      files_read: asNumber(replay.files_read),
+      scanned: asNumber(replay.scanned),
+      skipped: asNumber(replay.skipped),
+      replayed: asNumber(replay.replayed),
+      completed_at: asString(replay.completed_at),
+    },
+  };
+}
+
+export async function replayArchive(request: ReplayRequest) {
+  const payload = await requestJSON<ReplayResponse>(
+    `${INGEST_API_BASE_URL}/api/v1/admin/replay`,
+    {
+      method: "POST",
+      headers: {
+        ...buildHeaders(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(request),
+    },
+  );
+  return normalizeReplayResponse(payload);
+}
+
+function normalizeEvidenceSummary(payload: EvidenceSummary): EvidenceSummary {
+  const benchmark = payload?.benchmark
+    ? {
+        artifact: asString(payload.benchmark.artifact),
+        started_at_utc: asString(payload.benchmark.started_at_utc),
+        completed_at_utc: asString(payload.benchmark.completed_at_utc),
+        target_eps: asNumber(payload.benchmark.target_eps),
+        accepted_eps: asNumber(payload.benchmark.accepted_eps),
+        processed_eps: asNumber(payload.benchmark.processed_eps),
+        query_p95_ms: asNumber(payload.benchmark.query_p95_ms),
+        peak_lag: asNumber(payload.benchmark.peak_lag),
+        producer_count: asNumber(payload.benchmark.producer_count, 1),
+        processor_replicas: asNumber(payload.benchmark.processor_replicas),
+        summary: asString(payload.benchmark.summary),
+        gaps: asArray<string>(payload.benchmark.gaps).map((gap) => asString(gap)),
+      }
+    : null;
+
+  return {
+    schema_version: asNumber(payload?.schema_version, 1),
+    generated_at: asString(payload?.generated_at),
+    status: asString(payload?.status, "missing"),
+    artifact_root: asString(payload?.artifact_root),
+    benchmark,
+    failure_drills: asArray<EvidenceSummary["failure_drills"][number]>(
+      payload?.failure_drills,
+    ).map((drill) => ({
+      scenario_id: asString(drill?.scenario_id),
+      title: asString(drill?.title, "Unknown drill"),
+      status: asString(drill?.status, "missing"),
+      artifact: asString(drill?.artifact),
+      started_at_utc: asString(drill?.started_at_utc),
+      completed_at_utc: asString(drill?.completed_at_utc),
+      result: asString(drill?.result),
+      operator_note: asString(drill?.operator_note),
+      remaining_gap: asString(drill?.remaining_gap),
+      metrics: asArray<EvidenceSummary["failure_drills"][number]["metrics"][number]>(
+        drill?.metrics,
+      ).map((metric) => ({
+        label: asString(metric?.label),
+        value: asString(metric?.value),
+        unit: metric?.unit ? asString(metric.unit) : undefined,
+        tone: metric?.tone ? asString(metric.tone) : undefined,
+      })),
+    })),
+  };
+}
+
+export async function fetchEvidenceSummary() {
+  const payload = await fetchJSON<EvidenceSummary>("/api/v1/evidence/latest");
+  return normalizeEvidenceSummary(payload);
 }

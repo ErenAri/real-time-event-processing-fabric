@@ -239,6 +239,16 @@ try {
     $result | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 $OutputPath
     Write-Host "Poison-message drill artifact written to $OutputPath"
     Write-Host ($result | ConvertTo-Json -Depth 6)
+
+    $evidenceScript = Join-Path $repoRoot "scripts/evidence/update-evidence.ps1"
+    if (Test-Path $evidenceScript) {
+        try {
+            & $evidenceScript | Out-Null
+        }
+        catch {
+            Write-Warning "Poison-message drill completed, but evidence summary refresh failed: $($_.Exception.Message)"
+        }
+    }
 }
 finally {
     if ($null -ne $drillProcessor) {

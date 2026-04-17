@@ -2,6 +2,8 @@ param(
     [ValidateSet("compose", "local")]
     [string]$ProducerMode = "compose",
     [int]$Rate = 5000,
+    [int]$ProducerCount = 1,
+    [int]$ProducerPortStart = 18083,
     [int]$DurationSeconds = 60,
     [int]$WarmupSeconds = 5,
     [int]$SampleIntervalMilliseconds = 1000,
@@ -39,6 +41,48 @@ if ([string]::IsNullOrWhiteSpace($BearerToken)) {
 }
 if ([string]::IsNullOrWhiteSpace($BearerToken)) {
     $BearerToken = $defaultBearerToken
+}
+
+if ($ProducerCount -lt 1) {
+    throw "ProducerCount must be greater than or equal to 1."
+}
+
+function Get-ProducerRate {
+    param([int]$Index)
+
+    $baseRate = [Math]::Floor($Rate / $ProducerCount)
+    $remainder = $Rate % $ProducerCount
+    if ($Index -le $remainder) {
+        return [int]($baseRate + 1)
+    }
+    return [int]$baseRate
+}
+
+function Get-BenchmarkContainerName {
+    param([int]$Index)
+
+    if ($ProducerCount -eq 1) {
+        return $benchmarkContainerName
+    }
+    return "$benchmarkContainerName-$Index"
+}
+
+function Get-ProducerStdoutPath {
+    param([int]$Index)
+
+    if ($ProducerCount -eq 1) {
+        return Join-Path $artifactDir "producer-benchmark-$runId.stdout.log"
+    }
+    return Join-Path $artifactDir "producer-benchmark-$runId-$Index.stdout.log"
+}
+
+function Get-ProducerStderrPath {
+    param([int]$Index)
+
+    if ($ProducerCount -eq 1) {
+        return Join-Path $artifactDir "producer-benchmark-$runId.stderr.log"
+    }
+    return Join-Path $artifactDir "producer-benchmark-$runId-$Index.stderr.log"
 }
 
 function Get-Percentile {
@@ -104,6 +148,47 @@ function Test-ContainerExists {
 
     $names = @(docker ps -a --format "{{.Names}}")
     return ($names -contains $Name)
+}
+
+function Wait-ContainerHTTPReady {
+    param(
+        [string]$ContainerName,
+        [string]$Url = "http://localhost:8083/healthz",
+        [int]$TimeoutSeconds = 20
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            docker exec $ContainerName wget -qO- $Url | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                return $true
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    return $false
+}
+
+function Stop-BenchmarkContainers {
+    param([object[]]$ProducerRuns)
+
+    foreach ($producer in @($ProducerRuns)) {
+        if ($producer.mode -ne "compose") {
+            continue
+        }
+        try {
+            if (Test-ContainerExists -Name $producer.name) {
+                docker rm -f $producer.name | Out-Null
+            }
+        }
+        catch {
+            Write-Warning "Failed to remove benchmark producer container $($producer.name)."
+        }
+    }
 }
 
 function Stop-ComposeSimulator {
@@ -317,6 +402,9 @@ function Save-Environment {
         SIM_MALFORMED_EVERY      = $env:SIM_MALFORMED_EVERY
         SIM_BURST_EVERY          = $env:SIM_BURST_EVERY
         SIM_BURST_SIZE           = $env:SIM_BURST_SIZE
+        SIM_PRODUCER_ID          = $env:SIM_PRODUCER_ID
+        SIM_SEED                 = $env:SIM_SEED
+        SIMULATOR_LISTEN_ADDR    = $env:SIMULATOR_LISTEN_ADDR
         SIM_INGEST_ENDPOINT      = $env:SIM_INGEST_ENDPOINT
         SIM_BEARER_TOKEN         = $env:SIM_BEARER_TOKEN
         HTTP_ACCESS_LOG_ENABLED  = $env:HTTP_ACCESS_LOG_ENABLED
@@ -375,11 +463,13 @@ function Get-HardwareSummary {
 }
 
 if ($MaxInFlight -le 0) {
-    $MaxInFlight = [Math]::Min([Math]::Max($Rate, 64), 2048)
+    $defaultProducerRate = [Math]::Max(1, [Math]::Ceiling($Rate / [double]$ProducerCount))
+    $MaxInFlight = [Math]::Min([Math]::Max($defaultProducerRate, 64), 2048)
 }
 
 $savedEnvironment = Save-Environment
-$loadProcess = $null
+$loadProcesses = @()
+$producerRuns = @()
 $resumeSimulator = $false
 $restoreProcessorReplicas = $null
 $producerStdoutPath = $null
@@ -402,8 +492,8 @@ $endSample = $null
 $startMetrics = $null
 $endMetrics = $null
 $reportPath = $OutputPath
-$producerStdoutPath = Join-Path $artifactDir "producer-benchmark-$runId.stdout.log"
-$producerStderrPath = Join-Path $artifactDir "producer-benchmark-$runId.stderr.log"
+$producerStdoutPath = Get-ProducerStdoutPath -Index 1
+$producerStderrPath = Get-ProducerStderrPath -Index 1
 
 try {
     if ($ProcessorReplicas -gt 0 -and $ProcessorReplicas -ne $originalProcessorReplicas) {
@@ -435,19 +525,6 @@ try {
     }
 
     if ($ProducerMode -eq "local") {
-        $env:SIM_RATE_PER_SEC = "$Rate"
-        $env:SIM_TENANT_COUNT = "$TenantCount"
-        $env:SIM_SOURCES_PER_TENANT = "$SourcesPerTenant"
-        $env:SIM_MAX_IN_FLIGHT = "$MaxInFlight"
-        $env:SIM_DUPLICATE_EVERY = "$DuplicateEvery"
-        $env:SIM_MALFORMED_EVERY = "$MalformedEvery"
-        $env:SIM_BURST_EVERY = $BurstEvery
-        $env:SIM_BURST_SIZE = "$BurstSize"
-        $env:SIM_INGEST_ENDPOINT = $Endpoint
-        $env:SIM_BEARER_TOKEN = $BearerToken
-        $env:HTTP_ACCESS_LOG_ENABLED = "false"
-        $env:OTEL_TRACES_EXPORTER = "none"
-
         Write-Host "Building benchmark producer binary..."
         go build -o $binaryPath ./services/producer-simulator
         if ($LASTEXITCODE -ne 0) {
@@ -455,44 +532,124 @@ try {
             throw "Failed to build benchmark producer binary."
         }
 
-        Write-Host "Starting local benchmark producer against $Endpoint at $Rate events/sec for $DurationSeconds seconds..."
-        $loadProcess = Start-Process `
-            -FilePath $binaryPath `
-            -WorkingDirectory $repoRoot `
-            -PassThru `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $producerStdoutPath `
-            -RedirectStandardError $producerStderrPath
+        Write-Host "Starting $ProducerCount local benchmark producer(s) against $Endpoint at $Rate total events/sec for $DurationSeconds seconds..."
+        for ($i = 1; $i -le $ProducerCount; $i++) {
+            $producerRate = Get-ProducerRate -Index $i
+            $stdoutPath = Get-ProducerStdoutPath -Index $i
+            $stderrPath = Get-ProducerStderrPath -Index $i
+            $producerID = "bench-$runId-$i"
+            $healthUrl = $SimulatorHealthEndpoint
+
+            $env:SIM_RATE_PER_SEC = "$producerRate"
+            $env:SIM_TENANT_COUNT = "$TenantCount"
+            $env:SIM_SOURCES_PER_TENANT = "$SourcesPerTenant"
+            $env:SIM_MAX_IN_FLIGHT = "$MaxInFlight"
+            $env:SIM_DUPLICATE_EVERY = "$DuplicateEvery"
+            $env:SIM_MALFORMED_EVERY = "$MalformedEvery"
+            $env:SIM_BURST_EVERY = $BurstEvery
+            $env:SIM_BURST_SIZE = "$BurstSize"
+            $env:SIM_PRODUCER_ID = $producerID
+            $env:SIM_SEED = "$([int64]42 + $i)"
+            $env:SIM_INGEST_ENDPOINT = $Endpoint
+            $env:SIM_BEARER_TOKEN = $BearerToken
+            $env:HTTP_ACCESS_LOG_ENABLED = "false"
+            $env:OTEL_TRACES_EXPORTER = "none"
+
+            if ($ProducerCount -gt 1) {
+                $listenPort = $ProducerPortStart + $i - 1
+                $env:SIMULATOR_LISTEN_ADDR = ":$listenPort"
+                $healthUrl = "http://localhost:$listenPort/healthz"
+            }
+            else {
+                Remove-Item "Env:SIMULATOR_LISTEN_ADDR" -ErrorAction SilentlyContinue
+            }
+
+            $process = Start-Process `
+                -FilePath $binaryPath `
+                -WorkingDirectory $repoRoot `
+                -PassThru `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput $stdoutPath `
+                -RedirectStandardError $stderrPath
+
+            $loadProcesses += $process
+            $producerRuns += [pscustomobject]@{
+                mode        = "local"
+                name        = $producerID
+                rate        = $producerRate
+                producer_id = $producerID
+                health_url  = $healthUrl
+                stdout_log  = $stdoutPath
+                stderr_log  = $stderrPath
+            }
+        }
     }
     else {
-        Write-Host "Starting compose benchmark producer against $ComposeIngestEndpoint at $Rate events/sec for $DurationSeconds seconds..."
-        if (Test-ContainerExists -Name $benchmarkContainerName) {
-            docker rm -f $benchmarkContainerName | Out-Null
-        }
-        docker compose -f $ComposeFile run -d `
-            --name $benchmarkContainerName `
-            --no-deps `
-            --service-ports `
-            -e SIM_INGEST_ENDPOINT=$ComposeIngestEndpoint `
-            -e SIM_BEARER_TOKEN=$BearerToken `
-            -e SIM_RATE_PER_SEC=$Rate `
-            -e SIM_TENANT_COUNT=$TenantCount `
-            -e SIM_SOURCES_PER_TENANT=$SourcesPerTenant `
-            -e SIM_MAX_IN_FLIGHT=$MaxInFlight `
-            -e SIM_DUPLICATE_EVERY=$DuplicateEvery `
-            -e SIM_MALFORMED_EVERY=$MalformedEvery `
-            -e SIM_BURST_EVERY=$BurstEvery `
-            -e SIM_BURST_SIZE=$BurstSize `
-            -e HTTP_ACCESS_LOG_ENABLED=false `
-            -e OTEL_TRACES_EXPORTER=none `
-            producer-simulator | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to start compose benchmark producer container."
+        Write-Host "Starting $ProducerCount compose benchmark producer(s) against $ComposeIngestEndpoint at $Rate total events/sec for $DurationSeconds seconds..."
+        for ($i = 1; $i -le $ProducerCount; $i++) {
+            $containerName = Get-BenchmarkContainerName -Index $i
+            $producerRate = Get-ProducerRate -Index $i
+            $stdoutPath = Get-ProducerStdoutPath -Index $i
+            $stderrPath = Get-ProducerStderrPath -Index $i
+            $producerID = "bench-$runId-$i"
+
+            if (Test-ContainerExists -Name $containerName) {
+                docker rm -f $containerName | Out-Null
+            }
+
+            $composeArgs = @(
+                "compose", "-f", $ComposeFile,
+                "run", "-d",
+                "--name", $containerName,
+                "--no-deps"
+            )
+            if ($ProducerCount -eq 1) {
+                $composeArgs += "--service-ports"
+            }
+            $composeArgs += @(
+                "-e", "SIM_INGEST_ENDPOINT=$ComposeIngestEndpoint",
+                "-e", "SIM_BEARER_TOKEN=$BearerToken",
+                "-e", "SIM_RATE_PER_SEC=$producerRate",
+                "-e", "SIM_TENANT_COUNT=$TenantCount",
+                "-e", "SIM_SOURCES_PER_TENANT=$SourcesPerTenant",
+                "-e", "SIM_MAX_IN_FLIGHT=$MaxInFlight",
+                "-e", "SIM_DUPLICATE_EVERY=$DuplicateEvery",
+                "-e", "SIM_MALFORMED_EVERY=$MalformedEvery",
+                "-e", "SIM_BURST_EVERY=$BurstEvery",
+                "-e", "SIM_BURST_SIZE=$BurstSize",
+                "-e", "SIM_PRODUCER_ID=$producerID",
+                "-e", "SIM_SEED=$([int64]42 + $i)",
+                "-e", "HTTP_ACCESS_LOG_ENABLED=false",
+                "-e", "OTEL_TRACES_EXPORTER=none",
+                "producer-simulator"
+            )
+
+            & docker @composeArgs | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to start compose benchmark producer container $containerName."
+            }
+
+            $producerRuns += [pscustomobject]@{
+                mode        = "compose"
+                name        = $containerName
+                rate        = $producerRate
+                producer_id = $producerID
+                health_url  = "container:http://localhost:8083/healthz"
+                stdout_log  = $stdoutPath
+                stderr_log  = $stderrPath
+            }
         }
     }
 
-    if (-not (Wait-HttpReady -Url $SimulatorHealthEndpoint -TimeoutSeconds 20)) {
-        throw "Benchmark producer did not become ready on $SimulatorHealthEndpoint."
+    foreach ($producer in @($producerRuns)) {
+        if ($producer.mode -eq "compose" -and $ProducerCount -gt 1) {
+            if (-not (Wait-ContainerHTTPReady -ContainerName $producer.name -TimeoutSeconds 20)) {
+                throw "Benchmark producer $($producer.name) did not become ready inside its container."
+            }
+        }
+        elseif (-not (Wait-HttpReady -Url $producer.health_url -TimeoutSeconds 20)) {
+            throw "Benchmark producer $($producer.name) did not become ready on $($producer.health_url)."
+        }
     }
 
     if ($WarmupSeconds -gt 0) {
@@ -511,32 +668,29 @@ try {
 
     Start-Sleep -Seconds 2
     $endMetrics = Get-ServiceMetricsSnapshot -PrometheusBaseUrl $PrometheusEndpoint
-    $endSample = Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint
+    $endSample = Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint -Token $BearerToken
 }
 finally {
     if ($ProducerMode -eq "local") {
-        if ($null -ne $loadProcess -and -not $loadProcess.HasExited) {
-            Stop-Process -Id $loadProcess.Id -Force
+        foreach ($process in @($loadProcesses)) {
+            if ($null -ne $process -and -not $process.HasExited) {
+                Stop-Process -Id $process.Id -Force
+            }
         }
         Restore-Environment $savedEnvironment
     }
     else {
-        try {
-            if (Test-ContainerExists -Name $benchmarkContainerName) {
-                docker logs $benchmarkContainerName 1> $producerStdoutPath 2> $producerStderrPath
+        foreach ($producer in @($producerRuns)) {
+            try {
+                if (Test-ContainerExists -Name $producer.name) {
+                    docker logs $producer.name 1> $producer.stdout_log 2> $producer.stderr_log
+                }
+            }
+            catch {
+                Write-Warning "Failed to capture benchmark container logs for $($producer.name)."
             }
         }
-        catch {
-            Write-Warning "Failed to capture benchmark container logs."
-        }
-        try {
-            if (Test-ContainerExists -Name $benchmarkContainerName) {
-                docker rm -f $benchmarkContainerName | Out-Null
-            }
-        }
-        catch {
-            Write-Warning "Failed to remove benchmark container."
-        }
+        Stop-BenchmarkContainers -ProducerRuns $producerRuns
     }
 
     if ($null -ne $restoreProcessorReplicas -and $restoreProcessorReplicas -ge 0) {
@@ -615,6 +769,7 @@ if ($producerSentDelta -gt 0) {
 
 $report = [ordered]@{
     producer_mode               = $ProducerMode
+    producer_count              = $ProducerCount
     started_at_utc              = $startSample.timestamp_utc
     completed_at_utc            = $endSample.timestamp_utc
     measured_duration_seconds   = $measuredSeconds
@@ -623,7 +778,7 @@ $report = [ordered]@{
     sample_interval_ms          = $SampleIntervalMilliseconds
     tenant_count                = $TenantCount
     sources_per_tenant          = $SourcesPerTenant
-    max_in_flight               = $MaxInFlight
+    max_in_flight_per_producer  = $MaxInFlight
     duplicate_every             = $DuplicateEvery
     malformed_every             = $MalformedEvery
     burst_every                 = $BurstEvery
@@ -655,6 +810,16 @@ $report = [ordered]@{
     sample_count                = $samples.Count
     producer_stdout_log         = $producerStdoutPath
     producer_stderr_log         = $producerStderrPath
+    producer_runs               = @($producerRuns | ForEach-Object {
+        [ordered]@{
+            name        = $_.name
+            mode        = $_.mode
+            rate        = $_.rate
+            producer_id = $_.producer_id
+            stdout_log  = $_.stdout_log
+            stderr_log  = $_.stderr_log
+        }
+    })
     machine                     = Get-HardwareSummary
 }
 
@@ -667,6 +832,7 @@ $report | ConvertTo-Json -Depth 8 | Set-Content -Path $reportPath
 Write-Host ""
 Write-Host "Benchmark report written to $reportPath"
 Write-Host ("Producer Mode       : {0}" -f $report.producer_mode)
+Write-Host ("Producer Count      : {0}" -f $report.producer_count)
 Write-Host ("Processor Replicas  : {0}" -f $report.processor_replicas_observed)
 Write-Host ("Producer EPS        : {0}" -f $report.producer_sent_eps)
 Write-Host ("Accepted EPS        : {0}" -f $report.accepted_eps)
@@ -677,7 +843,7 @@ Write-Host ("Peak in-flight      : {0}" -f $report.peak_inflight_messages)
 Write-Host ("Peak P95 ms         : {0}" -f $report.peak_processing_p95_ms)
 Write-Host ("Peak P99 ms         : {0}" -f $report.peak_processing_p99_ms)
 Write-Host ("Query P95 ms        : {0}" -f $report.query_latency_p95_ms)
-Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | {7} | {8} producer, replicas {9}, max_in_flight {10} |" -f `
+Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | {7} | {8} producers, mode {9}, replicas {10}, max_in_flight/producer {11} |" -f `
     (Get-Date -Format "yyyy-MM-dd"), `
     $Rate, `
     [Math]::Round($measuredSeconds, 0), `
@@ -686,6 +852,17 @@ Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | 
     $report.peak_processing_p95_ms, `
     $report.peak_processing_p99_ms, `
     $report.peak_consumer_lag, `
+    $report.producer_count, `
     $report.producer_mode, `
     $report.processor_replicas_observed, `
-    $report.max_in_flight)
+    $report.max_in_flight_per_producer)
+
+$evidenceScript = Join-Path $repoRoot "scripts/evidence/update-evidence.ps1"
+if (Test-Path $evidenceScript) {
+    try {
+        & $evidenceScript | Out-Null
+    }
+    catch {
+        Write-Warning "Benchmark completed, but evidence summary refresh failed: $($_.Exception.Message)"
+    }
+}

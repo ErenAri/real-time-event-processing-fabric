@@ -358,11 +358,8 @@ func TestIngestHandlerRejectsWhenBackpressureLimitIsReached(t *testing.T) {
 	if secondRecorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", secondRecorder.Code)
 	}
-	if len(recorder.records) != 1 {
-		t.Fatalf("expected one rejection record, got %d", len(recorder.records))
-	}
-	if recorder.records[0].Reason != "backpressure" {
-		t.Fatalf("expected backpressure rejection, got %q", recorder.records[0].Reason)
+	if len(recorder.records) != 0 {
+		t.Fatalf("expected backpressure to stay metric-only, got %d persisted records", len(recorder.records))
 	}
 
 	close(publisher.release)

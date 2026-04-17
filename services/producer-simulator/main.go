@@ -78,6 +78,7 @@ func run() error {
 	}
 	endpoint := platform.EnvString("SIM_INGEST_ENDPOINT", "http://localhost:8080/api/v1/events")
 	bearerToken := platform.EnvString("SIM_BEARER_TOKEN", "")
+	producerID := platform.EnvString("SIM_PRODUCER_ID", "")
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
@@ -85,6 +86,7 @@ func run() error {
 	generator := simulator.NewGenerator(simulator.Config{
 		Endpoint:         endpoint,
 		BearerToken:      bearerToken,
+		ProducerID:       producerID,
 		RatePerSecond:    ratePerSecond,
 		TenantCount:      tenantCount,
 		SourcesPerTenant: sourcesPerTenant,
@@ -132,7 +134,7 @@ func run() error {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("service_starting", "listen_addr", listenAddr, "ingest_endpoint", endpoint, "rate_per_second", ratePerSecond)
+	logger.Info("service_starting", "listen_addr", listenAddr, "ingest_endpoint", endpoint, "rate_per_second", ratePerSecond, "producer_id", producerID)
 	select {
 	case <-ctx.Done():
 		return nil
