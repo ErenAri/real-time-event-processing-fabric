@@ -1,11 +1,13 @@
 import type {
   EvidenceSummary,
   Overview,
+  PartitionResponse,
   RejectionsResponse,
   ReplayRequest,
   ReplayResponse,
   SourcesResponse,
   TenantSeriesResponse,
+  WindowResponse,
 } from "./types";
 
 const API_BASE_URL =
@@ -74,6 +76,7 @@ function normalizeOverview(payload: Overview): Overview {
     rejected_total: asNumber(payload?.rejected_total),
     processed_total: asNumber(payload?.processed_total),
     duplicate_total: asNumber(payload?.duplicate_total),
+    late_event_total: asNumber(payload?.late_event_total),
     dead_letter_total: asNumber(payload?.dead_letter_total),
     consumer_lag: asNumber(payload?.consumer_lag),
     processor_instances: asNumber(payload?.processor_instances),
@@ -84,6 +87,21 @@ function normalizeOverview(payload: Overview): Overview {
     processing_p50_ms: asNumber(payload?.processing_p50_ms),
     processing_p95_ms: asNumber(payload?.processing_p95_ms),
     processing_p99_ms: asNumber(payload?.processing_p99_ms),
+    batch_size_p95: asNumber(payload?.batch_size_p95),
+    batch_flush_p95_ms: asNumber(payload?.batch_flush_p95_ms),
+    window_sizes: asArray<string>(payload?.window_sizes).map((item) => asString(item)),
+    allowed_lateness: asString(payload?.allowed_lateness, "2m0s"),
+    partition_health: asArray<Overview["partition_health"][number]>(payload?.partition_health).map((item) => ({
+      partition: asNumber(item?.partition),
+      owner_instance_id: item?.owner_instance_id ? asString(item.owner_instance_id) : undefined,
+      lag: asNumber(item?.lag),
+      processed_total: asNumber(item?.processed_total),
+      duplicate_total: asNumber(item?.duplicate_total),
+      late_event_total: asNumber(item?.late_event_total),
+      inflight_messages: asNumber(item?.inflight_messages),
+      last_offset: asNumber(item?.last_offset),
+      last_seen_at: asString(item?.last_seen_at),
+    })),
     ingest_last_seen_at: payload?.ingest_last_seen_at ? asString(payload.ingest_last_seen_at) : undefined,
     processor_last_seen_at: payload?.processor_last_seen_at ? asString(payload.processor_last_seen_at) : undefined,
     recent_rejections: asArray<Overview["recent_rejections"][number]>(payload?.recent_rejections).map((item) => ({
@@ -116,6 +134,50 @@ export async function fetchTenantSeries(tenantId: string, window = "15m") {
       warn_count: asNumber(item?.warn_count),
       error_count: asNumber(item?.error_count),
       average_value: asNumber(item?.average_value),
+    })),
+  };
+}
+
+export async function fetchEventWindows(tenantId: string, windowSize = "1m", lookback = "15m") {
+  const payload = await fetchJSON<WindowResponse>(
+    `/api/v1/metrics/windows?tenantId=${encodeURIComponent(tenantId)}&windowSize=${encodeURIComponent(windowSize)}&lookback=${encodeURIComponent(lookback)}`,
+  );
+  return {
+    tenant_id: asString(payload?.tenant_id, tenantId),
+    source_id: asString(payload?.source_id),
+    window_size: asString(payload?.window_size, windowSize),
+    lookback: asString(payload?.lookback, lookback),
+    semantic: asString(payload?.semantic, "event_time"),
+    windows: asArray<WindowResponse["windows"][number]>(payload?.windows).map((item) => ({
+      window_start: asString(item?.window_start),
+      window_size: asString(item?.window_size, windowSize),
+      tenant_id: asString(item?.tenant_id, tenantId),
+      source_id: item?.source_id ? asString(item.source_id) : undefined,
+      events_count: asNumber(item?.events_count),
+      ok_count: asNumber(item?.ok_count),
+      warn_count: asNumber(item?.warn_count),
+      error_count: asNumber(item?.error_count),
+      average_value: asNumber(item?.average_value),
+      max_event_at: asString(item?.max_event_at),
+      freshness_ms: asNumber(item?.freshness_ms),
+    })),
+  };
+}
+
+export async function fetchPartitionHealth() {
+  const payload = await fetchJSON<PartitionResponse>("/api/v1/metrics/partitions");
+  return {
+    generated_at: asString(payload?.generated_at),
+    partitions: asArray<PartitionResponse["partitions"][number]>(payload?.partitions).map((item) => ({
+      partition: asNumber(item?.partition),
+      owner_instance_id: item?.owner_instance_id ? asString(item.owner_instance_id) : undefined,
+      lag: asNumber(item?.lag),
+      processed_total: asNumber(item?.processed_total),
+      duplicate_total: asNumber(item?.duplicate_total),
+      late_event_total: asNumber(item?.late_event_total),
+      inflight_messages: asNumber(item?.inflight_messages),
+      last_offset: asNumber(item?.last_offset),
+      last_seen_at: asString(item?.last_seen_at),
     })),
   };
 }
@@ -201,10 +263,20 @@ function normalizeEvidenceSummary(payload: EvidenceSummary): EvidenceSummary {
         processed_eps: asNumber(payload.benchmark.processed_eps),
         query_p95_ms: asNumber(payload.benchmark.query_p95_ms),
         peak_lag: asNumber(payload.benchmark.peak_lag),
+        post_load_drain_seconds: asNumber(payload.benchmark.post_load_drain_seconds),
         producer_count: asNumber(payload.benchmark.producer_count, 1),
         processor_replicas: asNumber(payload.benchmark.processor_replicas),
         summary: asString(payload.benchmark.summary),
         gaps: asArray<string>(payload.benchmark.gaps).map((gap) => asString(gap)),
+        gates: asArray<NonNullable<EvidenceSummary["benchmark"]>["gates"][number]>(
+          payload.benchmark.gates,
+        ).map((gate) => ({
+          name: asString(gate?.name),
+          status: asString(gate?.status, "unknown"),
+          target: asNumber(gate?.target),
+          observed: asNumber(gate?.observed),
+          unit: gate?.unit ? asString(gate.unit) : undefined,
+        })),
       }
     : null;
 

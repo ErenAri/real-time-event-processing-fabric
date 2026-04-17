@@ -19,6 +19,7 @@ import (
 
 	"pulsestream/internal/deadletter"
 	"pulsestream/internal/events"
+	"pulsestream/internal/store"
 	"pulsestream/internal/telemetry"
 )
 
@@ -88,35 +89,56 @@ type blockingStore struct {
 	releaseBlocked chan struct{}
 }
 
-func (s *blockingStore) RecordProcessedEvent(ctx context.Context, event events.TelemetryEvent) (bool, error) {
-	switch event.SourceID {
-	case "sensor_blocked":
-		close(s.startedBlocked)
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-s.releaseBlocked:
+func (s *blockingStore) RecordProcessedEventBatch(ctx context.Context, inputs []store.ProcessedEventInput) (store.ProcessedEventBatchResult, error) {
+	result := store.ProcessedEventBatchResult{}
+	for _, input := range inputs {
+		event := input.Event
+		switch event.SourceID {
+		case "sensor_blocked":
+			close(s.startedBlocked)
+			select {
+			case <-ctx.Done():
+				return store.ProcessedEventBatchResult{}, ctx.Err()
+			case <-s.releaseBlocked:
+			}
+		case "sensor_fast":
+			close(s.startedFast)
 		}
-	case "sensor_fast":
-		close(s.startedFast)
-	}
 
-	return true, nil
+		result.RecordedCount++
+	}
+	return result, nil
 }
 
 type successfulStore struct{}
 
-func (s *successfulStore) RecordProcessedEvent(context.Context, events.TelemetryEvent) (bool, error) {
-	return true, nil
+func (s *successfulStore) RecordProcessedEventBatch(_ context.Context, inputs []store.ProcessedEventInput) (store.ProcessedEventBatchResult, error) {
+	return store.ProcessedEventBatchResult{RecordedCount: int64(len(inputs))}, nil
 }
 
 type countingStore struct {
 	processed atomic.Int64
 }
 
-func (s *countingStore) RecordProcessedEvent(context.Context, events.TelemetryEvent) (bool, error) {
-	s.processed.Add(1)
-	return true, nil
+func (s *countingStore) RecordProcessedEventBatch(_ context.Context, inputs []store.ProcessedEventInput) (store.ProcessedEventBatchResult, error) {
+	s.processed.Add(int64(len(inputs)))
+	return store.ProcessedEventBatchResult{RecordedCount: int64(len(inputs))}, nil
+}
+
+type capturingBatchStore struct {
+	mu     sync.Mutex
+	inputs []store.ProcessedEventInput
+	err    error
+}
+
+func (s *capturingBatchStore) RecordProcessedEventBatch(_ context.Context, inputs []store.ProcessedEventInput) (store.ProcessedEventBatchResult, error) {
+	if s.err != nil {
+		return store.ProcessedEventBatchResult{}, s.err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inputs = append(s.inputs, inputs...)
+	return store.ProcessedEventBatchResult{RecordedCount: int64(len(inputs))}, nil
 }
 
 func TestRunnerProcessesDifferentPartitionsInParallel(t *testing.T) {
@@ -476,5 +498,115 @@ func TestRunnerRetriesCommitErrorsUntilCommitSucceeds(t *testing.T) {
 	defer reader.mu.Unlock()
 	if len(reader.committed) != 1 {
 		t.Fatalf("expected commit after retries, got %d committed messages", len(reader.committed))
+	}
+}
+
+func TestRunnerDoesNotCommitBatchWhenStoreFails(t *testing.T) {
+	reader := &fakeReader{}
+	store := &capturingBatchStore{err: errors.New("db unavailable")}
+	runner := NewRunner(reader, store, nil, nilLogger(), prometheus.NewRegistry(), RunnerConfig{})
+
+	payload, err := events.EncodeTelemetryEvent(events.TelemetryEvent{
+		SchemaVersion: events.CurrentSchemaVersion,
+		EventID:       "evt-store-failure",
+		TenantID:      "tenant_01",
+		SourceID:      "sensor_001",
+		EventType:     "telemetry",
+		Timestamp:     time.Now().UTC(),
+		Value:         10,
+		Status:        events.StatusOK,
+		Region:        "eu-west",
+		Sequence:      1,
+	})
+	if err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+
+	err = runner.flushBatch(context.Background(), 0, []batchMessage{{
+		Message: kafka.Message{Topic: "pulsestream.events", Partition: 0, Offset: 1, Value: payload},
+		Event: events.TelemetryEvent{
+			SchemaVersion: events.CurrentSchemaVersion,
+			EventID:       "evt-store-failure",
+			TenantID:      "tenant_01",
+			SourceID:      "sensor_001",
+			EventType:     "telemetry",
+			Timestamp:     time.Now().UTC(),
+			Value:         10,
+			Status:        events.StatusOK,
+			Region:        "eu-west",
+			Sequence:      1,
+		},
+	}})
+	if err == nil {
+		t.Fatal("expected store failure")
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	if len(reader.committed) != 0 {
+		t.Fatalf("expected zero commits when store batch fails, got %d", len(reader.committed))
+	}
+}
+
+func TestRunnerClassifiesLateEventsByPartitionWatermark(t *testing.T) {
+	reader := &fakeReader{}
+	store := &capturingBatchStore{}
+	runner := NewRunner(reader, store, nil, nilLogger(), prometheus.NewRegistry(), RunnerConfig{
+		MaxBatchSize:       3,
+		BatchFlushInterval: time.Hour,
+		AllowedLateness:    2 * time.Minute,
+	})
+
+	base := time.Date(2026, 4, 18, 10, 0, 0, 0, time.UTC)
+	eventsToSend := []events.TelemetryEvent{
+		testTelemetryEvent("evt-in-order", base, 1),
+		testTelemetryEvent("evt-advance-watermark", base.Add(3*time.Minute), 2),
+		testTelemetryEvent("evt-late", base.Add(30*time.Second), 3),
+	}
+
+	messages := make(chan kafka.Message, len(eventsToSend))
+	for index, event := range eventsToSend {
+		payload, err := events.EncodeTelemetryEvent(event)
+		if err != nil {
+			t.Fatalf("encode event %s: %v", event.EventID, err)
+		}
+		messages <- kafka.Message{
+			Topic:     "pulsestream.events",
+			Partition: 0,
+			Offset:    int64(index + 1),
+			Value:     payload,
+		}
+	}
+	close(messages)
+
+	if err := runner.runPartitionWorker(context.Background(), 0, messages); err != nil {
+		t.Fatalf("run partition worker: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.inputs) != 3 {
+		t.Fatalf("expected 3 store inputs, got %d", len(store.inputs))
+	}
+	if store.inputs[0].Late || store.inputs[1].Late {
+		t.Fatalf("expected first two events to be on time, got %+v", store.inputs)
+	}
+	if !store.inputs[2].Late {
+		t.Fatalf("expected third event to be late, got %+v", store.inputs[2])
+	}
+}
+
+func testTelemetryEvent(eventID string, timestamp time.Time, sequence int64) events.TelemetryEvent {
+	return events.TelemetryEvent{
+		SchemaVersion: events.CurrentSchemaVersion,
+		EventID:       eventID,
+		TenantID:      "tenant_01",
+		SourceID:      "sensor_001",
+		EventType:     "telemetry",
+		Timestamp:     timestamp,
+		Value:         10,
+		Status:        events.StatusOK,
+		Region:        "eu-west",
+		Sequence:      sequence,
 	}
 }

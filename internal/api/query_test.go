@@ -19,12 +19,14 @@ import (
 )
 
 type fakeMetricsReader struct {
-	overview      store.Overview
-	tenantSeries  []store.TenantBucket
-	topSources    []store.SourceMetric
-	rejections    []store.RecentRejection
-	lastTenantID  string
-	lastTopTenant string
+	overview         store.Overview
+	tenantSeries     []store.TenantBucket
+	windows          []store.WindowBucket
+	topSources       []store.SourceMetric
+	rejections       []store.RecentRejection
+	lastTenantID     string
+	lastWindowTenant string
+	lastTopTenant    string
 }
 
 func (f *fakeMetricsReader) GetOverview(context.Context) (store.Overview, error) {
@@ -34,6 +36,11 @@ func (f *fakeMetricsReader) GetOverview(context.Context) (store.Overview, error)
 func (f *fakeMetricsReader) GetTenantSeries(_ context.Context, tenantID string, _ time.Duration) ([]store.TenantBucket, error) {
 	f.lastTenantID = tenantID
 	return f.tenantSeries, nil
+}
+
+func (f *fakeMetricsReader) GetEventWindows(_ context.Context, tenantID string, _ string, _ time.Duration, _ time.Duration) ([]store.WindowBucket, error) {
+	f.lastWindowTenant = tenantID
+	return f.windows, nil
 }
 
 func (f *fakeMetricsReader) GetTopSources(_ context.Context, tenantID string, _ int) ([]store.SourceMetric, error) {

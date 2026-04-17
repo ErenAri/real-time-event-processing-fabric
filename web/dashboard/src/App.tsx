@@ -17,6 +17,7 @@ import {
 
 import {
   fetchEvidenceSummary,
+  fetchEventWindows,
   fetchOverview,
   fetchRejections,
   fetchTenantSeries,
@@ -27,10 +28,12 @@ import type {
   EvidenceSummary,
   FailureDrillEvidence,
   Overview,
+  PartitionState,
   RecentRejection,
   ReplayResponse,
   SourceMetric,
   TenantBucket,
+  WindowBucket,
 } from "./types";
 
 const pollIntervalMs = 2000;
@@ -42,6 +45,7 @@ const emptyOverview: Overview = {
   rejected_total: 0,
   processed_total: 0,
   duplicate_total: 0,
+  late_event_total: 0,
   dead_letter_total: 0,
   consumer_lag: 0,
   processor_instances: 0,
@@ -52,6 +56,11 @@ const emptyOverview: Overview = {
   processing_p50_ms: 0,
   processing_p95_ms: 0,
   processing_p99_ms: 0,
+  batch_size_p95: 0,
+  batch_flush_p95_ms: 0,
+  window_sizes: ["1m", "5m"],
+  allowed_lateness: "2m0s",
+  partition_health: [],
   recent_rejections: [],
 };
 
@@ -200,6 +209,7 @@ export default function App() {
   const [tenantId, setTenantId] = useState(defaultTenant);
   const [overview, setOverview] = useState<Overview>(emptyOverview);
   const [series, setSeries] = useState<TenantBucket[]>([]);
+  const [windows, setWindows] = useState<WindowBucket[]>([]);
   const [sources, setSources] = useState<SourceMetric[]>([]);
   const [rejections, setRejections] = useState<RecentRejection[]>([]);
   const [evidence, setEvidence] = useState<EvidenceSummary | null>(null);
@@ -228,10 +238,11 @@ export default function App() {
                 : "Unknown evidence sync error",
           }));
 
-        const [overviewResponse, seriesResponse, sourcesResponse, rejectionResponse, evidenceResponse] =
+        const [overviewResponse, seriesResponse, windowResponse, sourcesResponse, rejectionResponse, evidenceResponse] =
           await Promise.all([
             fetchOverview(),
             fetchTenantSeries(tenantId),
+            fetchEventWindows(tenantId, "1m", "15m"),
             fetchTopSources(tenantId),
             fetchRejections(12),
             evidenceRequest,
@@ -244,6 +255,7 @@ export default function App() {
         startTransition(() => {
           setOverview(overviewResponse);
           setSeries(seriesResponse.series);
+          setWindows(windowResponse.windows);
           setSources(sourcesResponse.sources);
           setRejections(rejectionResponse.rejections);
           setEvidence(evidenceResponse.summary);
@@ -368,7 +380,7 @@ export default function App() {
         <MetricCard
           label="Processed"
           value={formatNumber(overview.processed_total)}
-          detail={`${formatNumber(acceptedVsProcessed, 1)}% of accepted count represented in hot views`}
+          detail={`${formatNumber(acceptedVsProcessed, 1)}% of accepted; late skipped ${formatNumber(overview.late_event_total)}`}
         />
         <MetricCard
           label="Throughput"
@@ -431,6 +443,9 @@ export default function App() {
           </div>
         </article>
 
+        <EventTimeWindowPanel tenantId={tenantId} windows={windows} allowedLateness={overview.allowed_lateness} />
+        <PartitionHealthPanel partitions={overview.partition_health} />
+
         <article className="panel">
           <div className="panel-header">
             <div>
@@ -443,6 +458,8 @@ export default function App() {
             <StatRow label="P50" value={`${formatNumber(overview.processing_p50_ms, 2)} ms`} />
             <StatRow label="P95" value={`${formatNumber(overview.processing_p95_ms, 2)} ms`} />
             <StatRow label="P99" value={`${formatNumber(overview.processing_p99_ms, 2)} ms`} />
+            <StatRow label="Batch P95" value={`${formatNumber(overview.batch_flush_p95_ms, 2)} ms`} />
+            <StatRow label="Batch size P95" value={formatNumber(overview.batch_size_p95, 0)} />
             <StatRow label="Processor replicas" value={formatNumber(overview.processor_instances)} />
             <StatRow label="Dead-lettered" value={formatNumber(overview.dead_letter_total)} />
             <StatRow label="Active partitions" value={formatNumber(overview.processor_active_partitions)} />
@@ -683,6 +700,79 @@ function ReplayPanel(props: {
   );
 }
 
+function EventTimeWindowPanel(props: {
+  tenantId: string;
+  windows: WindowBucket[];
+  allowedLateness: string;
+}) {
+  return (
+    <article className="panel panel-wide">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Event-time windows</p>
+          <h2>{props.tenantId} fixed 1-minute windows</h2>
+        </div>
+        <p className="panel-caption">
+          Deterministic boundaries from event timestamps. Allowed lateness: {props.allowedLateness}.
+        </p>
+      </div>
+      <div className="chart-surface">
+        <ResponsiveContainer width="100%" height={280}>
+          <AreaChart data={props.windows}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.18)" />
+            <XAxis
+              dataKey="window_start"
+              tickFormatter={(value) => new Date(value).toLocaleTimeString([], { minute: "2-digit", second: "2-digit" })}
+              stroke="#9fb9c6"
+            />
+            <YAxis stroke="#9fb9c6" />
+            <Tooltip
+              labelFormatter={(value) => new Date(value).toLocaleString()}
+              contentStyle={{ background: "#08232f", border: "1px solid #19465a", borderRadius: 16 }}
+            />
+            <Area type="monotone" dataKey="events_count" stroke="#a6e36f" fill="#a6e36f" fillOpacity={0.58} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      {props.windows.length === 0 ? (
+        <p className="empty-state">No event-time window rows yet. Start load after the schema migration is applied.</p>
+      ) : null}
+    </article>
+  );
+}
+
+function PartitionHealthPanel(props: { partitions: PartitionState[] }) {
+  const hottest = [...props.partitions].sort((a, b) => b.lag - a.lag).slice(0, 6);
+  return (
+    <article className="panel">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Partition health</p>
+          <h2>Task ownership and lag</h2>
+        </div>
+        <p className="panel-caption">Kafka Streams-style visibility for active processor tasks.</p>
+      </div>
+      <div className="partition-list">
+        {hottest.length === 0 ? (
+          <p className="empty-state">No partition snapshot yet.</p>
+        ) : (
+          hottest.map((partition) => (
+            <article className="partition-row" key={`${partition.owner_instance_id}-${partition.partition}`}>
+              <div>
+                <strong>Partition {partition.partition}</strong>
+                <span>{partition.owner_instance_id || "unassigned"}</span>
+              </div>
+              <StatBadge label="Lag" value={formatNumber(partition.lag)} />
+              <StatBadge label="Processed" value={formatNumber(partition.processed_total)} />
+              <StatBadge label="In-flight" value={formatNumber(partition.inflight_messages)} />
+            </article>
+          ))
+        )}
+      </div>
+    </article>
+  );
+}
+
 function FailureEvidencePanel(props: {
   evidence: EvidenceSummary | null;
   evidenceError: string;
@@ -716,6 +806,15 @@ function FailureEvidencePanel(props: {
             <StatBadge label="Processed" value={`${formatNumber(benchmark.processed_eps, 1)} eps`} />
             <StatBadge label="Query P95" value={`${formatNumber(benchmark.query_p95_ms, 2)} ms`} />
           </div>
+          {benchmark.gates.length > 0 ? (
+            <div className="gate-list">
+              {benchmark.gates.map((gate) => (
+                <span className={`gate-chip ${gate.status}`} key={gate.name}>
+                  {gate.name}: {gate.status} ({formatNumber(gate.observed, 2)}{gate.unit ? ` ${gate.unit}` : ""})
+                </span>
+              ))}
+            </div>
+          ) : null}
           <small>{benchmark.artifact}</small>
         </div>
       ) : null}

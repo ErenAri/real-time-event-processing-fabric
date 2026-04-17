@@ -6,6 +6,7 @@ PulseStream is a real-time event analytics platform for synthetic telemetry. It 
 
 - Event-driven architecture with a broker-backed write path
 - Idempotent at-least-once processing with duplicate suppression
+- Bounded processor batching, event-time windows, late-event counters, and partition/task visibility
 - Separation of hot operational state and cold raw event storage
 - JWT authentication, tenant-scoped authorization, and PostgreSQL row-level security
 - Failure handling with restart, poison-message, broker-outage, Postgres-pause, and replay drills
@@ -56,9 +57,9 @@ flowchart LR
 | --- | --- |
 | `producer-simulator` | Generates synthetic telemetry, duplicates, malformed payloads, and burst traffic |
 | `ingest-service` | Authenticates producers, validates events, records rejections, writes raw archive entries, and publishes to Kafka |
-| `stream-processor` | Consumes Kafka partitions, deduplicates by `event_id`, dead-letters poison records, computes aggregates, and writes hot views |
-| `query-service` | Serves overview, tenant-series, top-source, rejection, and tenant-scoped dashboard APIs |
-| `dashboard` | Renders live operator views from the query API |
+| `stream-processor` | Consumes Kafka partitions, batches per-partition writes, deduplicates by `event_id`, classifies late events, dead-letters poison records, computes hot and event-time aggregates, and writes service snapshots |
+| `query-service` | Serves overview, tenant-series, event-window, partition-health, top-source, rejection, and tenant-scoped dashboard APIs |
+| `dashboard` | Renders live operator views, event-time windows, partition health, replay controls, and evidence gates |
 | `Prometheus` and `Grafana` | Scrape and display platform metrics |
 
 ## Current evidence
@@ -168,6 +169,7 @@ asyncapi.yaml
 - [Architecture](docs/architecture.md)
 - [API specification](docs/api-spec.md)
 - [Data model](docs/data-model.md)
+- [Processing guarantees](docs/processing-guarantees.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Failure modes](docs/failure-modes.md)
 - [Runbook](docs/runbook.md)
@@ -190,6 +192,6 @@ asyncapi.yaml
 
 - Redis caching is not part of the current hot path; PostgreSQL remains the only operational read store.
 - Azure dashboard deployment and published Azure benchmark evidence are still follow-on work.
-- The MVP `5,000 eps` target is not met yet. The latest local 5k offered-load run accepted `955.91 eps` and processed `329.37 eps`.
-- The local date-partitioned archive scanned `670,695` records to replay `25` in the latest drill, so production-scale replay needs tenant/time indexing or object-prefix partitioning.
+- The MVP `5,000 eps` target is not met yet. The latest published local 5k offered-load run accepted `955.91 eps` and processed `329.37 eps`; the next gate is `2,000 processed eps` after the batching change.
+- New archive records use tenant/hour prefixes for scoped replay. Existing date-only archives are still readable, and old replay evidence remains useful as the baseline for why indexing was added.
 - Controlled recovery drills pass at sustainable rates; overload drills are still useful, but should be documented as degraded-mode evidence rather than success evidence.

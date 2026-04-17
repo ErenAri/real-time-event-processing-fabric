@@ -67,7 +67,7 @@ flowchart LR
 - `producer-simulator`: emits synthetic telemetry at configurable rates, including duplicates, malformed payloads, and burst traffic
 - `ingest-service`: authenticates producers, validates event payloads, records rejections, archives raw events, publishes accepted events to Kafka, and exposes the replay endpoint
 - `raw archive`: immutable NDJSON or Blob-backed event log written before broker publish, used for replay and backfills
-- `stream-processor`: consumes Kafka partitions, processes partitions in parallel while preserving per-partition ordering, deduplicates by `event_id`, dead-letters poison records, computes hot aggregates, and stores per-instance service state snapshots
+- `stream-processor`: consumes Kafka partitions, processes partitions in parallel while preserving per-partition ordering, batches hot writes, deduplicates by `event_id`, classifies late events, dead-letters poison records, computes hot and event-time aggregates, and stores per-instance service state snapshots
 - `query-service`: exposes tenant-scoped low-latency operational APIs for dashboard reads
 - `PostgreSQL`: hot store for aggregate buckets, source counters, rejection history, deduplication state, row-level security, and service state
 - `Kafka`: durable broker between write and processing paths, with a dedicated DLQ topic for processor-side poison messages
@@ -91,8 +91,9 @@ sequenceDiagram
     Ingest->>Archive: append raw payload
     Ingest->>Kafka: publish accepted event
     Kafka-->>Processor: deliver message
-    Processor->>Processor: decode and deduplicate
-    Processor->>Postgres: upsert hot aggregates and service state
+    Processor->>Processor: decode, batch by partition, classify lateness, and deduplicate
+    Processor->>Postgres: commit dedup claims, hot aggregates, and event-time windows
+    Processor->>Kafka: commit offsets after DB success
 ```
 
 Poison-message path:
@@ -166,11 +167,13 @@ Each processor replica writes an instance-scoped heartbeat and metric snapshot i
 | Replica observability | Prometheus Docker service discovery | Allows local processor scaling evidence without static scrape targets |
 | Poison-message handling | Dedicated Kafka DLQ | Keeps processor-side bad records from blocking the consumer loop |
 | Contract governance | AsyncAPI plus JSON Schema | Kafka topics and payloads are versioned in source control and validated in CI |
+| Stream framework | Custom Go processor, with Flink and Kafka Streams as reference standards | Throughput and semantics should be credible before adding a framework dependency |
 
 ## Data owned by PostgreSQL
 
 - `tenant_metrics`: 10-second aggregate buckets for tenant charts
 - `source_metrics`: cumulative source counts for top-N queries
+- `event_windows`: fixed 1-minute and 5-minute event-time windows by tenant and source
 - `processed_events`: deduplication keys
 - `rejection_events`: ingest-side validation and publish failures
 - `service_state`: per-instance snapshots for ingest, query, and processor services
@@ -180,8 +183,8 @@ Each processor replica writes an instance-scoped heartbeat and metric snapshot i
 - Request tracing is wired in through OpenTelemetry, but trace export is disabled by default for throughput runs.
 - Prometheus scrapes services directly from Docker discovery metadata rather than static target lists.
 - Grafana is provisioned only as a local visualization layer. The query API remains the system-of-record read surface for the dashboard.
-- Processor snapshot payloads carry `dead_letter_total`, active partitions, in-flight message count, and p50/p95/p99 processing latency.
-- The local archive is currently date-partitioned, which is durable enough for MVP replay proof but inefficient for selective tenant replay at large volumes.
+- Processor snapshot payloads carry `dead_letter_total`, `late_event_total`, active partitions, per-partition ownership, in-flight message count, batch flush metrics, and p50/p95/p99 processing latency.
+- New local archive records are partitioned by UTC day, tenant, and hour. Replay still falls back to the legacy date-only layout for older artifacts.
 
 ## Azure deployment path
 

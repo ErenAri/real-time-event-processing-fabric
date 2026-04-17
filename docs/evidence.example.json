@@ -12,11 +12,44 @@
     "processed_eps": 329.37,
     "query_p95_ms": 147.13,
     "peak_lag": 10969,
+    "post_load_drain_seconds": 999999,
     "producer_count": 4,
     "processor_replicas": 3,
     "summary": "Accepted 955.9 eps and processed 329.4 eps against a 5,000 eps target using 4 producers and 3 processor replicas.",
     "gaps": [
-      "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck."
+      "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck.",
+      "Processed throughput is below the next credibility gate of 2,000 eps.",
+      "Post-load drain exceeded 30 seconds; processor capacity does not yet clear backlog quickly."
+    ],
+    "gates": [
+      {
+        "name": "processed_eps_2000",
+        "status": "fail",
+        "target": 2000,
+        "observed": 329.37,
+        "unit": "eps"
+      },
+      {
+        "name": "processed_eps_5000",
+        "status": "fail",
+        "target": 5000,
+        "observed": 329.37,
+        "unit": "eps"
+      },
+      {
+        "name": "query_p95_250ms",
+        "status": "pass",
+        "target": 250,
+        "observed": 147.13,
+        "unit": "ms"
+      },
+      {
+        "name": "post_load_drain_30s",
+        "status": "fail",
+        "target": 30,
+        "observed": 999999,
+        "unit": "s"
+      }
     ]
   },
   "failure_drills": [

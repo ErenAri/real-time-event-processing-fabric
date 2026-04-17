@@ -19,18 +19,28 @@ type Summary struct {
 }
 
 type Benchmark struct {
-	Artifact      string   `json:"artifact"`
-	StartedAt     string   `json:"started_at_utc"`
-	CompletedAt   string   `json:"completed_at_utc"`
-	TargetEPS     float64  `json:"target_eps"`
-	AcceptedEPS   float64  `json:"accepted_eps"`
-	ProcessedEPS  float64  `json:"processed_eps"`
-	QueryP95MS    float64  `json:"query_p95_ms"`
-	PeakLag       int64    `json:"peak_lag"`
-	ProducerCount int      `json:"producer_count"`
-	Replicas      int      `json:"processor_replicas"`
-	Summary       string   `json:"summary"`
-	Gaps          []string `json:"gaps"`
+	Artifact             string   `json:"artifact"`
+	StartedAt            string   `json:"started_at_utc"`
+	CompletedAt          string   `json:"completed_at_utc"`
+	TargetEPS            float64  `json:"target_eps"`
+	AcceptedEPS          float64  `json:"accepted_eps"`
+	ProcessedEPS         float64  `json:"processed_eps"`
+	QueryP95MS           float64  `json:"query_p95_ms"`
+	PeakLag              int64    `json:"peak_lag"`
+	PostLoadDrainSeconds float64  `json:"post_load_drain_seconds"`
+	ProducerCount        int      `json:"producer_count"`
+	Replicas             int      `json:"processor_replicas"`
+	Summary              string   `json:"summary"`
+	Gaps                 []string `json:"gaps"`
+	Gates                []Gate   `json:"gates"`
+}
+
+type Gate struct {
+	Name     string  `json:"name"`
+	Status   string  `json:"status"`
+	Target   float64 `json:"target"`
+	Observed float64 `json:"observed"`
+	Unit     string  `json:"unit,omitempty"`
 }
 
 type FailureDrill struct {
@@ -102,6 +112,9 @@ func LoadSummary(path string) (Summary, error) {
 	}
 	if summary.Benchmark != nil && summary.Benchmark.Gaps == nil {
 		summary.Benchmark.Gaps = []string{}
+	}
+	if summary.Benchmark != nil && summary.Benchmark.Gates == nil {
+		summary.Benchmark.Gates = []Gate{}
 	}
 	for index := range summary.FailureDrills {
 		if summary.FailureDrills[index].Metrics == nil {

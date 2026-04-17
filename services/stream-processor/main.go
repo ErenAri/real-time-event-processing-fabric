@@ -46,6 +46,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	processorBatchSize, err := platform.EnvInt("PROCESSOR_BATCH_SIZE", 500)
+	if err != nil {
+		return err
+	}
+	processorBatchFlushInterval, err := platform.EnvDuration("PROCESSOR_BATCH_FLUSH_INTERVAL", 100*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	processorAllowedLateness, err := platform.EnvDuration("PROCESSOR_ALLOWED_LATENESS", 2*time.Minute)
+	if err != nil {
+		return err
+	}
 	retryBackoff, err := platform.EnvDuration("PROCESSOR_RETRY_BACKOFF", time.Second)
 	if err != nil {
 		return err
@@ -104,6 +116,9 @@ func run() error {
 		Brokers:                brokers,
 		ConsumerGroup:          groupID,
 		RetryBackoff:           retryBackoff,
+		MaxBatchSize:           processorBatchSize,
+		BatchFlushInterval:     processorBatchFlushInterval,
+		AllowedLateness:        processorAllowedLateness,
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
@@ -157,6 +172,9 @@ func run() error {
 		"group_id", groupID,
 		"instance_id", instanceID,
 		"partition_queue_capacity", partitionQueueCapacity,
+		"batch_size", processorBatchSize,
+		"batch_flush_interval", processorBatchFlushInterval.String(),
+		"allowed_lateness", processorAllowedLateness.String(),
 		"retry_backoff", retryBackoff.String(),
 	)
 	select {

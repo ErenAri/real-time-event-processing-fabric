@@ -162,6 +162,24 @@ function New-Metric {
     return $metric
 }
 
+function New-Gate {
+    param(
+        [string]$Name,
+        [double]$Target,
+        [double]$Observed,
+        [string]$Unit,
+        [bool]$Passed
+    )
+
+    return [ordered]@{
+        name = $Name
+        status = if ($Passed) { "pass" } else { "fail" }
+        target = $Target
+        observed = $Observed
+        unit = $Unit
+    }
+}
+
 function New-BenchmarkEvidence {
     $file = Get-LatestJson -Directory $benchmarkDir -Pattern "benchmark-*.json"
     $report = Read-JsonArtifact -File $file
@@ -173,15 +191,34 @@ function New-BenchmarkEvidence {
     $accepted = Get-NumberValue -Object $report -Name "accepted_eps"
     $processed = Get-NumberValue -Object $report -Name "processed_eps"
     $peakLag = [int64](Get-NumberValue -Object $report -Name "peak_consumer_lag")
+    $drainSeconds = if ($null -eq (Get-PropertyValue -Object $report -Name "post_load_drain_seconds" -Default $null)) {
+        999999
+    }
+    else {
+        Get-NumberValue -Object $report -Name "post_load_drain_seconds"
+    }
     $replicas = [int](Get-NumberValue -Object $report -Name "processor_replicas_observed")
     $producerCount = [int](Get-NumberValue -Object $report -Name "producer_count" -Default 1)
+    $queryP95 = Get-NumberValue -Object $report -Name "query_latency_p95_ms"
     $gaps = @()
+    $gates = @(
+        New-Gate "processed_eps_2000" 2000 $processed "eps" ($processed -ge 2000)
+        New-Gate "processed_eps_5000" 5000 $processed "eps" ($processed -ge 5000)
+        New-Gate "query_p95_250ms" 250 $queryP95 "ms" ($queryP95 -le 250)
+        New-Gate "post_load_drain_30s" 30 $drainSeconds "s" ($drainSeconds -le 30)
+    )
 
     if ($target -gt 0 -and $accepted -lt ($target * 0.8)) {
         $gaps += "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck."
     }
+    if ($processed -lt 2000) {
+        $gaps += "Processed throughput is below the next credibility gate of 2,000 eps."
+    }
     if ($peakLag -gt 50000) {
         $gaps += "Peak consumer lag exceeded 50,000 messages; drain capacity needs more work before claiming strong sustained throughput."
+    }
+    if ($drainSeconds -gt 30) {
+        $gaps += "Post-load drain exceeded 30 seconds; processor capacity does not yet clear backlog quickly."
     }
     if ($gaps.Count -eq 0) {
         $gaps += "No blocking benchmark gap detected by the summary generator; inspect raw artifact before publishing claims."
@@ -194,12 +231,14 @@ function New-BenchmarkEvidence {
         target_eps = $target
         accepted_eps = $accepted
         processed_eps = $processed
-        query_p95_ms = Get-NumberValue -Object $report -Name "query_latency_p95_ms"
+        query_p95_ms = $queryP95
         peak_lag = $peakLag
+        post_load_drain_seconds = $drainSeconds
         producer_count = $producerCount
         processor_replicas = $replicas
         summary = "Accepted $(Format-EvidenceNumber $accepted 1) eps and processed $(Format-EvidenceNumber $processed 1) eps against a $(Format-EvidenceNumber $target 0) eps target using $producerCount producer(s) and $replicas processor replica(s)."
         gaps = $gaps
+        gates = $gates
     }
 }
 

@@ -20,6 +20,7 @@ import (
 type MetricsReader interface {
 	GetOverview(ctx context.Context) (store.Overview, error)
 	GetTenantSeries(ctx context.Context, tenantID string, window time.Duration) ([]store.TenantBucket, error)
+	GetEventWindows(ctx context.Context, tenantID string, sourceID string, windowSize time.Duration, lookback time.Duration) ([]store.WindowBucket, error)
 	GetTopSources(ctx context.Context, tenantID string, limit int) ([]store.SourceMetric, error)
 	RecentRejections(ctx context.Context, limit int) ([]store.RecentRejection, error)
 }
@@ -63,6 +64,8 @@ func NewQueryHandler(logger *slog.Logger, reader MetricsReader, verifier *auth.V
 func (h *QueryHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/metrics/overview", h.wrap(h.handleOverview))
 	mux.HandleFunc("/api/v1/metrics/tenants/", h.wrap(h.handleTenantSeries))
+	mux.HandleFunc("/api/v1/metrics/windows", h.wrap(h.handleEventWindows))
+	mux.HandleFunc("/api/v1/metrics/partitions", h.wrap(h.handlePartitionHealth))
 	mux.HandleFunc("/api/v1/metrics/sources/top", h.wrap(h.handleTopSources))
 	mux.HandleFunc("/api/v1/metrics/rejections", h.wrap(h.handleRejections))
 	mux.HandleFunc("/api/v1/evidence/latest", h.wrap(h.handleEvidenceLatest))
@@ -140,6 +143,85 @@ func (h *QueryHandler) handleTenantSeries(w http.ResponseWriter, r *http.Request
 		"tenant_id": tenantID,
 		"window":    window.String(),
 		"series":    ensureTenantSeries(series),
+	})
+}
+
+func (h *QueryHandler) handleEventWindows(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+
+	tenantID := strings.TrimSpace(r.URL.Query().Get("tenantId"))
+	if principal.Role == auth.RoleTenantUser {
+		switch {
+		case tenantID == "":
+			tenantID = principal.TenantID
+		case tenantID != principal.TenantID:
+			platform.WriteError(w, http.StatusForbidden, "token tenant does not match requested tenant")
+			return
+		}
+	}
+	if tenantID == "" {
+		platform.WriteError(w, http.StatusBadRequest, "tenantId is required")
+		return
+	}
+
+	sourceID := strings.TrimSpace(r.URL.Query().Get("sourceId"))
+	windowSize := time.Minute
+	if raw := r.URL.Query().Get("windowSize"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			platform.WriteError(w, http.StatusBadRequest, "invalid windowSize")
+			return
+		}
+		windowSize = parsed
+	}
+	lookback := 15 * time.Minute
+	if raw := r.URL.Query().Get("lookback"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			platform.WriteError(w, http.StatusBadRequest, "invalid lookback")
+			return
+		}
+		lookback = parsed
+	}
+
+	windows, err := h.reader.GetEventWindows(auth.ContextWithPrincipal(r.Context(), principal), tenantID, sourceID, windowSize, lookback)
+	if err != nil {
+		h.logger.Error("event_windows_query_failed", "error", err, "tenant_id", tenantID, "source_id", sourceID)
+		platform.WriteError(w, http.StatusInternalServerError, "failed to load event-time windows")
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"tenant_id":   tenantID,
+		"source_id":   sourceID,
+		"window_size": windowSize.String(),
+		"lookback":    lookback.String(),
+		"windows":     ensureWindowBuckets(windows),
+		"semantic":    "event_time",
+	})
+}
+
+func (h *QueryHandler) handlePartitionHealth(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+	if principal.Role != auth.RoleAdmin {
+		platform.WriteError(w, http.StatusForbidden, "admin role is required")
+		return
+	}
+
+	overview, err := h.reader.GetOverview(auth.ContextWithPrincipal(r.Context(), principal))
+	if err != nil {
+		h.logger.Error("partition_health_query_failed", "error", err)
+		platform.WriteError(w, http.StatusInternalServerError, "failed to load partition health")
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"generated_at": overview.GeneratedAt,
+		"partitions":   ensurePartitionStates(overview.PartitionHealth),
 	})
 }
 
@@ -243,6 +325,20 @@ func ensureTenantSeries(series []store.TenantBucket) []store.TenantBucket {
 		return []store.TenantBucket{}
 	}
 	return series
+}
+
+func ensureWindowBuckets(windows []store.WindowBucket) []store.WindowBucket {
+	if windows == nil {
+		return []store.WindowBucket{}
+	}
+	return windows
+}
+
+func ensurePartitionStates(partitions []store.PartitionState) []store.PartitionState {
+	if partitions == nil {
+		return []store.PartitionState{}
+	}
+	return partitions
 }
 
 func ensureTopSources(sources []store.SourceMetric) []store.SourceMetric {

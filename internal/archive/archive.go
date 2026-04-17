@@ -83,7 +83,7 @@ func (a *FileArchive) Archive(ctx context.Context, event events.TelemetryEvent, 
 	if writerTimestamp.IsZero() {
 		writerTimestamp = record.ArchivedAt
 	}
-	if err := a.ensureWriterLocked(writerTimestamp); err != nil {
+	if err := a.ensureWriterLocked(writerTimestamp, event.TenantID); err != nil {
 		return err
 	}
 	if _, err := a.currentFile.Write(append(line, '\n')); err != nil {
@@ -122,55 +122,60 @@ func (a *FileArchive) Replay(
 			return result, err
 		}
 
-		path := a.pathForDate(day)
-		file, err := os.Open(path)
+		paths, err := a.pathsForReplayDay(day, result.TenantID)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return result, fmt.Errorf("open archive file %s: %w", path, err)
+			return result, err
 		}
+		for _, path := range paths {
+			file, err := os.Open(path)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return result, fmt.Errorf("open archive file %s: %w", path, err)
+			}
 
-		result.FilesRead++
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 2<<20)
+			result.FilesRead++
+			scanner := bufio.NewScanner(file)
+			scanner.Buffer(make([]byte, 0, 64*1024), 2<<20)
 
-		for scanner.Scan() {
-			if err := ctx.Err(); err != nil {
+			for scanner.Scan() {
+				if err := ctx.Err(); err != nil {
+					_ = file.Close()
+					return result, err
+				}
+
+				var record Record
+				if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+					_ = file.Close()
+					return result, fmt.Errorf("decode archive record from %s: %w", path, err)
+				}
+
+				result.Scanned++
+				if result.TenantID != "" && record.Event.TenantID != result.TenantID {
+					result.Skipped++
+					continue
+				}
+
+				if filter.Limit > 0 && result.Replayed >= int64(filter.Limit) {
+					_ = file.Close()
+					result.CompletedAt = time.Now().UTC()
+					return result, nil
+				}
+
+				if err := publish(ctx, record.Event); err != nil {
+					_ = file.Close()
+					return result, fmt.Errorf("publish replayed event %s: %w", record.Event.EventID, err)
+				}
+				result.Replayed++
+			}
+
+			if err := scanner.Err(); err != nil {
 				_ = file.Close()
-				return result, err
+				return result, fmt.Errorf("scan archive file %s: %w", path, err)
 			}
-
-			var record Record
-			if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
-				_ = file.Close()
-				return result, fmt.Errorf("decode archive record from %s: %w", path, err)
-			}
-
-			result.Scanned++
-			if result.TenantID != "" && record.Event.TenantID != result.TenantID {
-				result.Skipped++
-				continue
-			}
-
-			if filter.Limit > 0 && result.Replayed >= int64(filter.Limit) {
-				_ = file.Close()
-				result.CompletedAt = time.Now().UTC()
-				return result, nil
-			}
-
-			if err := publish(ctx, record.Event); err != nil {
-				_ = file.Close()
-				return result, fmt.Errorf("publish replayed event %s: %w", record.Event.EventID, err)
-			}
-			result.Replayed++
-		}
-
-		if err := scanner.Err(); err != nil {
 			_ = file.Close()
-			return result, fmt.Errorf("scan archive file %s: %w", path, err)
 		}
-		_ = file.Close()
 	}
 
 	result.CompletedAt = time.Now().UTC()
@@ -199,8 +204,9 @@ func ParseDate(value string) (time.Time, error) {
 	return normalizeDate(parsed), nil
 }
 
-func (a *FileArchive) ensureWriterLocked(timestamp time.Time) error {
-	key := normalizeDate(timestamp).Format(dateLayout)
+func (a *FileArchive) ensureWriterLocked(timestamp time.Time, tenantID string) error {
+	path := a.pathForEvent(timestamp, tenantID)
+	key := path
 	if a.currentFile != nil && a.currentKey == key {
 		return nil
 	}
@@ -211,7 +217,6 @@ func (a *FileArchive) ensureWriterLocked(timestamp time.Time) error {
 		}
 	}
 
-	path := a.pathForDate(timestamp)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create archive directory: %w", err)
 	}
@@ -226,6 +231,14 @@ func (a *FileArchive) ensureWriterLocked(timestamp time.Time) error {
 	return nil
 }
 
+func (a *FileArchive) pathForEvent(timestamp time.Time, tenantID string) string {
+	utc := timestamp.UTC()
+	if utc.IsZero() {
+		utc = time.Now().UTC()
+	}
+	return a.pathForTenantHour(utc, tenantID, utc.Hour())
+}
+
 func (a *FileArchive) pathForDate(timestamp time.Time) string {
 	utc := normalizeDate(timestamp)
 	return filepath.Join(
@@ -235,6 +248,70 @@ func (a *FileArchive) pathForDate(timestamp time.Time) string {
 		utc.Format("02"),
 		"events.ndjson",
 	)
+}
+
+func (a *FileArchive) pathForTenantHour(day time.Time, tenantID string, hour int) string {
+	utc := normalizeDate(day)
+	return filepath.Join(
+		a.rootDir,
+		utc.Format("2006"),
+		utc.Format("01"),
+		utc.Format("02"),
+		archivePathSegment(tenantID),
+		fmt.Sprintf("%02d", hour),
+		"events.ndjson",
+	)
+}
+
+func (a *FileArchive) pathsForReplayDay(day time.Time, tenantID string) ([]string, error) {
+	seen := map[string]struct{}{}
+	paths := []string{}
+	add := func(path string) {
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+
+	if strings.TrimSpace(tenantID) != "" {
+		for hour := 0; hour < 24; hour++ {
+			add(a.pathForTenantHour(day, tenantID, hour))
+		}
+		add(a.pathForDate(day))
+		return paths, nil
+	}
+
+	dayDir := filepath.Dir(a.pathForDate(day))
+	if err := filepath.WalkDir(dayDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Name() == "events.ndjson" {
+			add(path)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("walk archive directory %s: %w", dayDir, err)
+	}
+	add(a.pathForDate(day))
+	return paths, nil
+}
+
+func archivePathSegment(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "_unknown"
+	}
+	value = strings.ReplaceAll(value, `/`, `_`)
+	value = strings.ReplaceAll(value, `\`, `_`)
+	return value
 }
 
 func normalizeDate(value time.Time) time.Time {

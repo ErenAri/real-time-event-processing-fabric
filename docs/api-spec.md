@@ -8,6 +8,8 @@
 | `ingest-service` | `POST` | `/api/v1/admin/replay` | admin token or admin bearer JWT | Replay archived events back into Kafka |
 | `query-service` | `GET` | `/api/v1/metrics/overview` | bearer JWT | Return platform-wide overview metrics |
 | `query-service` | `GET` | `/api/v1/metrics/tenants/{tenantId}` | bearer JWT | Return tenant bucket series |
+| `query-service` | `GET` | `/api/v1/metrics/windows` | bearer JWT | Return event-time window aggregates |
+| `query-service` | `GET` | `/api/v1/metrics/partitions` | admin bearer JWT | Return processor partition ownership and lag |
 | `query-service` | `GET` | `/api/v1/metrics/sources/top` | bearer JWT | Return top sources, optionally filtered by tenant |
 | `query-service` | `GET` | `/api/v1/metrics/rejections` | bearer JWT | Return latest ingest rejections |
 | `query-service` | `GET` | `/api/v1/evidence/latest` | admin bearer JWT | Return the latest generated benchmark and failure-drill evidence summary |
@@ -83,6 +85,7 @@ Representative response shape:
   "rejected_total": 343,
   "processed_total": 1910754,
   "duplicate_total": 10385,
+  "late_event_total": 14,
   "dead_letter_total": 1,
   "consumer_lag": 0,
   "processor_instances": 3,
@@ -93,6 +96,23 @@ Representative response shape:
   "processing_p50_ms": 2,
   "processing_p95_ms": 6,
   "processing_p99_ms": 11,
+  "batch_size_p95": 500,
+  "batch_flush_p95_ms": 18,
+  "window_sizes": ["1m0s", "5m0s"],
+  "allowed_lateness": "2m0s",
+  "partition_health": [
+    {
+      "partition": 0,
+      "owner_instance_id": "stream-processor-a1",
+      "lag": 0,
+      "processed_total": 100244,
+      "duplicate_total": 120,
+      "late_event_total": 2,
+      "inflight_messages": 0,
+      "last_offset": 90231,
+      "last_seen_at": "2026-04-10T18:29:13Z"
+    }
+  ],
   "recent_rejections": []
 }
 ```
@@ -117,6 +137,65 @@ Response shape:
       "warn_count": 32,
       "error_count": 33,
       "average_value": 72.9
+    }
+  ]
+}
+```
+
+## Event-time windows
+
+### `GET /api/v1/metrics/windows?tenantId=tenant_01&windowSize=1m&lookback=15m`
+
+Returns fixed event-time windows assigned from event timestamps. `tenant_user` tokens can only read their assigned tenant. If `sourceId` is omitted, rows are aggregated across sources for the tenant.
+
+Response shape:
+
+```json
+{
+  "tenant_id": "tenant_01",
+  "source_id": "",
+  "window_size": "1m0s",
+  "lookback": "15m0s",
+  "semantic": "event_time",
+  "windows": [
+    {
+      "window_start": "2026-04-10T18:20:00Z",
+      "window_size": "1m0s",
+      "tenant_id": "tenant_01",
+      "events_count": 1200,
+      "ok_count": 1000,
+      "warn_count": 150,
+      "error_count": 50,
+      "average_value": 72.9,
+      "max_event_at": "2026-04-10T18:20:59Z",
+      "freshness_ms": 2500
+    }
+  ]
+}
+```
+
+## Partition health
+
+### `GET /api/v1/metrics/partitions`
+
+Returns active processor partition snapshots. This endpoint is admin-only because it exposes processor instance identifiers and operational topology.
+
+Response shape:
+
+```json
+{
+  "generated_at": "2026-04-10T18:29:14Z",
+  "partitions": [
+    {
+      "partition": 0,
+      "owner_instance_id": "stream-processor-a1",
+      "lag": 0,
+      "processed_total": 100244,
+      "duplicate_total": 120,
+      "late_event_total": 2,
+      "inflight_messages": 0,
+      "last_offset": 90231,
+      "last_seen_at": "2026-04-10T18:29:13Z"
     }
   ]
 }
@@ -157,11 +236,21 @@ Representative response shape:
     "processed_eps": 329.37,
     "query_p95_ms": 147.13,
     "peak_lag": 10969,
+    "post_load_drain_seconds": 999999,
     "producer_count": 4,
     "processor_replicas": 3,
     "summary": "Accepted 955.9 eps and processed 329.4 eps against a 5,000 eps target using 4 producers and 3 processor replicas.",
     "gaps": [
       "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck."
+    ],
+    "gates": [
+      {
+        "name": "processed_eps_2000",
+        "status": "fail",
+        "target": 2000,
+        "observed": 329.37,
+        "unit": "eps"
+      }
     ]
   },
   "failure_drills": [

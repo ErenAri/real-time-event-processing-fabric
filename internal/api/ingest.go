@@ -53,14 +53,15 @@ type IngestHandler struct {
 
 	inFlightLimit chan struct{}
 
-	requestDuration  prometheus.Histogram
-	publishDuration  prometheus.Histogram
-	archiveDuration  prometheus.Histogram
-	acceptedCounter  prometheus.Counter
-	archivedCounter  prometheus.Counter
-	replayCounter    prometheus.Counter
-	rejectedCounters *prometheus.CounterVec
-	inFlightGauge    prometheus.Gauge
+	requestDuration    prometheus.Histogram
+	validationDuration prometheus.Histogram
+	publishDuration    prometheus.Histogram
+	archiveDuration    prometheus.Histogram
+	acceptedCounter    prometheus.Counter
+	archivedCounter    prometheus.Counter
+	replayCounter      prometheus.Counter
+	rejectedCounters   *prometheus.CounterVec
+	inFlightGauge      prometheus.Gauge
 }
 
 func NewIngestHandler(
@@ -85,6 +86,11 @@ func NewIngestHandler(
 		requestDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "pulsestream_ingest_request_duration_seconds",
 			Help:    "Duration of ingest requests.",
+			Buckets: prometheus.DefBuckets,
+		}),
+		validationDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "pulsestream_ingest_validation_duration_seconds",
+			Help:    "Duration of event decode, authorization, and schema validation for ingest requests.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		publishDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -121,6 +127,7 @@ func NewIngestHandler(
 
 	registry.MustRegister(
 		handler.requestDuration,
+		handler.validationDuration,
 		handler.publishDuration,
 		handler.archiveDuration,
 		handler.acceptedCounter,
@@ -173,8 +180,13 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	validationStart := time.Now()
+	observeValidation := func() {
+		h.validationDuration.Observe(time.Since(validationStart).Seconds())
+	}
 	event, err := events.DecodeTelemetryEvent(body)
 	if err != nil {
+		observeValidation()
 		h.reject(r.Context(), body, "", "", "decode_failed")
 		platform.WriteError(w, http.StatusBadRequest, "invalid event payload")
 		return
@@ -182,14 +194,17 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	principal, ok := h.authorizeEventIngest(w, r, event.TenantID)
 	if !ok {
+		observeValidation()
 		return
 	}
 
 	if err := event.Validate(); err != nil {
+		observeValidation()
 		h.reject(r.Context(), body, event.TenantID, event.SourceID, "validation_failed")
 		platform.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	observeValidation()
 
 	ctx := auth.ContextWithPrincipal(r.Context(), principal)
 	if !h.tryAcquireInFlight() {

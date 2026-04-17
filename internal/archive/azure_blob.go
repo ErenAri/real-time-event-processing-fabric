@@ -44,7 +44,6 @@ type AzureBlobArchive struct {
 	mu          sync.Mutex
 	currentKey  string
 	buffer      bytes.Buffer
-	bufferDate  time.Time
 	bufferSince time.Time
 
 	now       func() time.Time
@@ -126,7 +125,7 @@ func (a *AzureBlobArchive) Archive(ctx context.Context, event events.TelemetryEv
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if err := a.rotateBufferLocked(ctx, normalizeDate(timestamp)); err != nil {
+	if err := a.rotateBufferLocked(ctx, a.eventPrefix(timestamp, event.TenantID)); err != nil {
 		return err
 	}
 	if _, err := a.buffer.Write(append(line, '\n')); err != nil {
@@ -169,9 +168,9 @@ func (a *AzureBlobArchive) Replay(
 			return result, err
 		}
 
-		names, err := a.store.List(ctx, a.dayPrefix(day)+"/")
+		names, err := a.blobsForReplayDay(ctx, day, result.TenantID)
 		if err != nil {
-			return result, fmt.Errorf("list archive blobs for %s: %w", day.Format(dateLayout), err)
+			return result, err
 		}
 		sort.Strings(names)
 
@@ -264,11 +263,9 @@ func (a *AzureBlobArchive) runPeriodicFlush() {
 	}
 }
 
-func (a *AzureBlobArchive) rotateBufferLocked(ctx context.Context, day time.Time) error {
-	key := day.Format(dateLayout)
+func (a *AzureBlobArchive) rotateBufferLocked(ctx context.Context, key string) error {
 	if a.currentKey == "" {
 		a.currentKey = key
-		a.bufferDate = day
 		a.bufferSince = a.now()
 		return nil
 	}
@@ -279,34 +276,40 @@ func (a *AzureBlobArchive) rotateBufferLocked(ctx context.Context, day time.Time
 		return err
 	}
 	a.currentKey = key
-	a.bufferDate = day
 	a.bufferSince = a.now()
 	return nil
 }
 
 func (a *AzureBlobArchive) flushLocked(ctx context.Context) error {
-	if a.buffer.Len() == 0 || a.currentKey == "" || a.bufferDate.IsZero() {
+	if a.buffer.Len() == 0 || a.currentKey == "" {
 		return nil
 	}
 
 	payload := append([]byte(nil), a.buffer.Bytes()...)
-	blobName := a.blobName(a.bufferDate)
+	blobName := a.blobName(a.currentKey)
 	if err := a.store.Upload(ctx, blobName, payload); err != nil {
 		return fmt.Errorf("upload archive blob %s: %w", blobName, err)
 	}
 
 	a.buffer.Reset()
 	a.currentKey = ""
-	a.bufferDate = time.Time{}
 	a.bufferSince = time.Time{}
 	return nil
 }
 
-func (a *AzureBlobArchive) blobName(day time.Time) string {
+func (a *AzureBlobArchive) blobName(prefix string) string {
 	return path.Join(
-		a.dayPrefix(day),
+		prefix,
 		fmt.Sprintf("events-%s-%s.ndjson", a.now().Format("20060102T150405.000000000Z"), uuid.NewString()),
 	)
+}
+
+func (a *AzureBlobArchive) eventPrefix(timestamp time.Time, tenantID string) string {
+	timestamp = timestamp.UTC()
+	if timestamp.IsZero() {
+		timestamp = a.now()
+	}
+	return path.Join(a.dayPrefix(timestamp), archivePathSegment(tenantID), fmt.Sprintf("%02d", timestamp.Hour()))
 }
 
 func (a *AzureBlobArchive) dayPrefix(day time.Time) string {
@@ -315,6 +318,49 @@ func (a *AzureBlobArchive) dayPrefix(day time.Time) string {
 		return path.Join(day.Format("2006"), day.Format("01"), day.Format("02"))
 	}
 	return path.Join(a.prefix, day.Format("2006"), day.Format("01"), day.Format("02"))
+}
+
+func (a *AzureBlobArchive) blobsForReplayDay(ctx context.Context, day time.Time, tenantID string) ([]string, error) {
+	seen := map[string]struct{}{}
+	names := []string{}
+	addNames := func(values []string) {
+		for _, name := range values {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+
+	if strings.TrimSpace(tenantID) != "" {
+		for hour := 0; hour < 24; hour++ {
+			prefix := path.Join(a.dayPrefix(day), archivePathSegment(tenantID), fmt.Sprintf("%02d", hour)) + "/"
+			values, err := a.store.List(ctx, prefix)
+			if err != nil {
+				return nil, fmt.Errorf("list archive blobs with prefix %s: %w", prefix, err)
+			}
+			addNames(values)
+		}
+	}
+
+	dayPrefix := a.dayPrefix(day)
+	values, err := a.store.List(ctx, dayPrefix+"/")
+	if err != nil {
+		return nil, fmt.Errorf("list archive blobs with prefix %s: %w", dayPrefix+"/", err)
+	}
+	if strings.TrimSpace(tenantID) != "" {
+		legacy := values[:0]
+		for _, name := range values {
+			remainder := strings.TrimPrefix(name, dayPrefix+"/")
+			if !strings.Contains(remainder, "/") {
+				legacy = append(legacy, name)
+			}
+		}
+		values = legacy
+	}
+	addNames(values)
+	return names, nil
 }
 
 func newLiveBlobStore(ctx context.Context, config AzureBlobConfig) (*liveBlobStore, error) {
