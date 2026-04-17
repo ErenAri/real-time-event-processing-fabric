@@ -55,6 +55,30 @@ function Wait-HttpReady {
     return $false
 }
 
+function Wait-ContainerHTTPReady {
+    param(
+        [string]$ContainerName,
+        [string]$Url = "http://localhost:8083/healthz",
+        [int]$TimeoutSeconds = 20
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            docker exec $ContainerName wget -qO- $Url | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                return $true
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    return $false
+}
+
 function Get-AuthHeaders {
     param([string]$Token)
 
@@ -274,7 +298,7 @@ try {
     if ($ProcessorReplicas -gt 0 -and $ProcessorReplicas -ne $originalProcessorReplicas) {
         Write-Host "Scaling stream-processor to $ProcessorReplicas replicas before the drill..."
         $restoreProcessorReplicas = $originalProcessorReplicas
-        docker compose -f $ComposeFile up -d --scale stream-processor=$ProcessorReplicas stream-processor prometheus | Out-Null
+        docker compose -f $ComposeFile up -d --no-deps --scale stream-processor=$ProcessorReplicas stream-processor | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to scale stream-processor."
         }
@@ -284,6 +308,8 @@ try {
     if ($processorContainers.Count -ne $ProcessorReplicas) {
         throw "Timed out waiting for $ProcessorReplicas stream-processor replicas."
     }
+
+    Stop-ComposeSimulator -ComposeFilePath $ComposeFile
 
     if (-not (Wait-HttpReady -Url "$PrometheusEndpoint/-/ready" -TimeoutSeconds 30)) {
         throw "Prometheus did not become ready."
@@ -301,7 +327,6 @@ try {
     docker compose -f $ComposeFile run -d `
         --name $benchmarkContainerName `
         --no-deps `
-        --service-ports `
         -e SIM_INGEST_ENDPOINT=http://ingest-service:8080/api/v1/events `
         -e SIM_BEARER_TOKEN=$BearerToken `
         -e SIM_RATE_PER_SEC=$Rate `
@@ -319,7 +344,7 @@ try {
         throw "Failed to start the broker-outage benchmark producer."
     }
 
-    if (-not (Wait-HttpReady -Url "http://localhost:8083/healthz" -TimeoutSeconds 20)) {
+    if (-not (Wait-ContainerHTTPReady -ContainerName $benchmarkContainerName -TimeoutSeconds 20)) {
         throw "Benchmark producer did not become ready."
     }
 
@@ -400,7 +425,7 @@ finally {
 
     if ($null -ne $restoreProcessorReplicas -and $restoreProcessorReplicas -ge 0) {
         try {
-            docker compose -f $ComposeFile up -d --scale stream-processor=$restoreProcessorReplicas stream-processor prometheus | Out-Null
+            docker compose -f $ComposeFile up -d --no-deps --scale stream-processor=$restoreProcessorReplicas stream-processor | Out-Null
         }
         catch {
             Write-Warning "Failed to restore the original stream-processor replica count."
@@ -500,3 +525,13 @@ Write-Host ("Backpressure delta    : {0}" -f $report.backpressure_total_delta)
 Write-Host ("Accounting gap        : {0}" -f $report.archive_accounting_gap)
 Write-Host ("Peak lag              : {0}" -f $report.peak_consumer_lag)
 Write-Host ("Recovered in window   : {0}" -f $report.accepted_recovered_within_window)
+
+$evidenceScript = Join-Path $repoRoot "scripts/evidence/update-evidence.ps1"
+if (Test-Path $evidenceScript) {
+    try {
+        & $evidenceScript | Out-Null
+    }
+    catch {
+        Write-Warning "Broker outage drill completed, but evidence summary refresh failed: $($_.Exception.Message)"
+    }
+}

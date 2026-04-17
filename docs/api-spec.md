@@ -10,6 +10,7 @@
 | `query-service` | `GET` | `/api/v1/metrics/tenants/{tenantId}` | bearer JWT | Return tenant bucket series |
 | `query-service` | `GET` | `/api/v1/metrics/sources/top` | bearer JWT | Return top sources, optionally filtered by tenant |
 | `query-service` | `GET` | `/api/v1/metrics/rejections` | bearer JWT | Return latest ingest rejections |
+| `query-service` | `GET` | `/api/v1/evidence/latest` | admin bearer JWT | Return the latest generated benchmark and failure-drill evidence summary |
 | every Go service | `GET` | `/healthz` | none | Liveness probe |
 | every Go service | `GET` | `/readyz` | none | Readiness probe |
 | every Go service | `GET` | `/metrics` | none | Prometheus metrics |
@@ -132,6 +133,58 @@ Returns the most active sources ordered by cumulative event count. `tenant_user`
 ### `GET /api/v1/metrics/rejections?limit=10`
 
 Returns the newest rejection rows recorded by the ingest service.
+
+## Evidence summary
+
+### `GET /api/v1/evidence/latest`
+
+Returns the generated operator evidence summary from `artifacts/evidence/latest.json`. The endpoint is admin-only because the response can expose operational artifacts and failure-drill details. If no evidence summary exists, the endpoint returns a `missing` summary with an empty drill list instead of failing the dashboard.
+
+Representative response shape:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-17T19:52:42Z",
+  "status": "available",
+  "artifact_root": "artifacts",
+  "benchmark": {
+    "artifact": "artifacts/benchmarks/benchmark-20260417-222710.json",
+    "started_at_utc": "2026-04-17T19:28:04Z",
+    "completed_at_utc": "2026-04-17T19:29:08Z",
+    "target_eps": 5000,
+    "accepted_eps": 955.91,
+    "processed_eps": 329.37,
+    "query_p95_ms": 147.13,
+    "peak_lag": 10969,
+    "producer_count": 4,
+    "processor_replicas": 3,
+    "summary": "Accepted 955.9 eps and processed 329.4 eps against a 5,000 eps target using 4 producers and 3 processor replicas.",
+    "gaps": [
+      "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck."
+    ]
+  },
+  "failure_drills": [
+    {
+      "scenario_id": "broker-outage",
+      "title": "Broker outage",
+      "status": "verified",
+      "artifact": "artifacts/failure-drills/broker-outage-20260417-224838.json",
+      "started_at_utc": "2026-04-17T19:49:02Z",
+      "completed_at_utc": "2026-04-17T19:49:52Z",
+      "result": "Archive accounting gap 0; accepted traffic recovered: True.",
+      "operator_note": "Publish failures are explicit, and the processor remains live while Kafka is unavailable.",
+      "remaining_gap": "Client-side timeout counts still require log parsing.",
+      "metrics": [
+        {
+          "label": "publish failed",
+          "value": "4,008"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ## Replay
 

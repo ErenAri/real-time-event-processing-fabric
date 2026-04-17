@@ -53,10 +53,10 @@ Use the resulting value as `Authorization: Bearer <jwt>` for ingest and query AP
 ## Scale processor replicas
 
 ```powershell
-docker compose -f deploy/docker-compose/docker-compose.yml up -d --scale stream-processor=3 stream-processor prometheus
+docker compose -f deploy/docker-compose/docker-compose.yml up -d --no-deps --scale stream-processor=3 stream-processor
 ```
 
-Prometheus must be included in the command because scrape target discovery depends on the current Docker container set.
+Prometheus uses Docker service discovery, so it should discover the new processor containers without being recreated. Avoid including `prometheus` in this command during drills because its compose dependencies can restart the steady-state `producer-simulator` and contaminate load evidence.
 
 ## Run a benchmark
 
@@ -64,15 +64,49 @@ Prometheus must be included in the command because scrape target discovery depen
 ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
 ```
 
-The script writes a JSON artifact to `artifacts/benchmarks/`.
+The script writes a JSON artifact to `artifacts/benchmarks/` and refreshes `artifacts/evidence/latest.json`.
+
+Run the current 5k offered-load profile when you need to reproduce the known throughput gap:
+
+```powershell
+./scripts/load-test/benchmark.ps1 -Rate 5000 -ProducerCount 4 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -MaxInFlight 1024 -TenantCount 50 -SourcesPerTenant 200
+```
+
+The latest run of that profile accepted `955.91 eps` and processed `329.37 eps`, so it is a bottleneck artifact rather than a passing MVP result.
 
 ## Run a restart drill
 
 ```powershell
-./scripts/chaos/restart-processor.ps1 -Rate 1000 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+./scripts/chaos/restart-processor.ps1 -Rate 300 -DurationSeconds 45 -WarmupSeconds 5 -ProcessorReplicas 3
 ```
 
-The script writes a JSON artifact to `artifacts/failure-drills/`.
+The script writes a JSON artifact to `artifacts/failure-drills/` and refreshes `artifacts/evidence/latest.json`.
+
+Use higher rates to test degraded behavior separately. A recent `800 eps` restart run continued processing but did not fully recover lag inside the observation window.
+
+## Refresh operator evidence
+
+If you add or copy artifacts manually, regenerate the dashboard evidence summary:
+
+```powershell
+./scripts/evidence/update-evidence.ps1
+```
+
+Validate the schema:
+
+```powershell
+npm run evidence:validate
+```
+
+Read the summary through the API:
+
+```powershell
+Invoke-RestMethod `
+  -Uri http://localhost:8081/api/v1/evidence/latest `
+  -Headers @{ Authorization = "Bearer <admin-jwt>" }
+```
+
+The dashboard reads this endpoint for the latest benchmark and failure-drill cards.
 
 ## Replay archived events
 
@@ -155,3 +189,13 @@ The drill creates a unique sentinel tenant, verifies the first replay is discard
 - Pause Postgres: `./scripts/chaos/pause-postgres.ps1`
 - Broker outage: `./scripts/chaos/broker-outage.ps1`
 - Replay archive and rebuild hot views: `./scripts/chaos/replay-archive.ps1`
+
+Current controlled drill commands:
+
+```powershell
+./scripts/chaos/restart-processor.ps1 -Rate 300 -DurationSeconds 45 -WarmupSeconds 5 -ProcessorReplicas 3
+./scripts/chaos/pause-postgres.ps1 -Rate 500 -DurationSeconds 45 -WarmupSeconds 5 -PauseSeconds 10 -ProcessorReplicas 3
+./scripts/chaos/broker-outage.ps1 -Rate 400 -DurationSeconds 50 -WarmupSeconds 5 -OutageSeconds 10 -ProcessorReplicas 3
+./scripts/chaos/inject-poison-message.ps1 -TimeoutSeconds 60 -ReadyTimeoutSeconds 20
+./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 120
+```

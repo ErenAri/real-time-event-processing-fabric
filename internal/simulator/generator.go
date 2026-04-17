@@ -22,6 +22,7 @@ import (
 type Config struct {
 	Endpoint         string
 	BearerToken      string
+	ProducerID       string
 	RatePerSecond    int
 	TenantCount      int
 	SourcesPerTenant int
@@ -202,10 +203,14 @@ func (g *Generator) nextEvent(sequence int64) events.TelemetryEvent {
 	source := fmt.Sprintf("sensor_%03d", 1+g.rng.Intn(max(1, g.config.SourcesPerTenant)))
 	statuses := []events.Status{events.StatusOK, events.StatusOK, events.StatusWarn, events.StatusError}
 	status := statuses[g.rng.Intn(len(statuses))]
+	eventID := fmt.Sprintf("%s-%s-%d", tenant, source, sequence)
+	if strings.TrimSpace(g.config.ProducerID) != "" {
+		eventID = fmt.Sprintf("%s-%s-%s-%d", tenant, source, g.config.ProducerID, sequence)
+	}
 
 	return events.TelemetryEvent{
 		SchemaVersion: events.CurrentSchemaVersion,
-		EventID:       fmt.Sprintf("%s-%s-%d", tenant, source, sequence),
+		EventID:       eventID,
 		TenantID:      tenant,
 		SourceID:      source,
 		EventType:     "telemetry",

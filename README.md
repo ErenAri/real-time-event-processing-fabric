@@ -65,15 +65,14 @@ flowchart LR
 
 | Scenario | Artifact | Summary |
 | --- | --- | --- |
-| Single processor benchmark | `artifacts/benchmarks/benchmark-20260410-212955.json` | `713.09 accepted eps`, `568.43 processed eps`, `p95 14 ms`, `lag peak 1308` |
-| Three processor benchmark | `artifacts/benchmarks/benchmark-20260410-213110.json` | `700.37 accepted eps`, `595.02 processed eps`, `p95 11 ms`, `lag peak 1246` |
-| Three replica restart drill | `artifacts/failure-drills/restart-processor-20260410-212812.json` | one processor replica restarted during load, `0` rejections, `p95 11 ms`, `lag peak 828` |
-| Poison-message drill | `artifacts/failure-drills/inject-poison-message-20260411-152328.json` | malformed Kafka record moved to DLQ and surfaced through `dead_letter_total` |
-| Broker outage drill | `artifacts/failure-drills/broker-outage-20260416-201249.json` | `12s` Kafka outage, `0` archive accounting gap, explicit `publish_failed` and `backpressure` rejections |
-| PostgreSQL pause drill | `artifacts/failure-drills/pause-postgres-20260416-202040.json` | `12s` Postgres pause, visible query degradation, processing resumed `1.24s` after Postgres became healthy |
-| Replay and rebuild drill | `artifacts/failure-drills/replay-archive-20260416173251.json` | `25` replayed duplicates produced `0` overcount; scoped reset rebuilt hot views back to `25` |
+| 5k offered-load benchmark | `artifacts/benchmarks/benchmark-20260417-222710.json` | `4` producers, `3` processors, target `5,000 eps`; observed `955.91 accepted eps`, `329.37 processed eps`, query `p95 147.13 ms`, peak lag `10,969`; target not met |
+| Processor restart drill | `artifacts/failure-drills/restart-processor-20260417-225121.json` | `3` processors, `300 eps`; one replica restarted, lag recovered in `6.29s`, final lag `0` |
+| Broker outage drill | `artifacts/failure-drills/broker-outage-20260417-224838.json` | `10s` Kafka outage, archive accounting gap `0`, accepted traffic recovered in `2.09s`, `4,008` explicit publish failures |
+| PostgreSQL pause drill | `artifacts/failure-drills/pause-postgres-20260417-224710.json` | `10s` Postgres pause, `3` overview API failures, processor progress resumed `0.02s` after Postgres became healthy |
+| Replay and rebuild drill | `artifacts/failure-drills/replay-archive-20260417193652.json` | `25` duplicate replays produced `0` source-metric overcount; scoped hot-view reset rebuilt processed/source counts back to `25` |
+| Poison-message drill | `artifacts/failure-drills/inject-poison-message-20260417-193308.json` | malformed Kafka record produced `dead_letter_delta: 1` without blocking the processor loop |
 
-Current local evidence shows that replica scaling improves processor-side throughput and tail latency, but the producer path is limiting higher-rate local measurements. The next measurement gap is a higher-capacity producer profile or a cloud deployment variant that can stress the consumer group more aggressively.
+Current local evidence is deliberately conservative. Recovery behavior is verified at sustainable rates, but the MVP `5,000 eps` throughput target is not yet met on this machine. The current bottleneck is the local write path under high offered load: producer/client timeouts, ingest publish/archive pressure, and PostgreSQL hot-view writes limit accepted and processed throughput before the dashboard/API layer becomes the bottleneck.
 
 ## Quick start
 
@@ -97,23 +96,30 @@ Current local evidence shows that replica scaling improves processor-side throug
    ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
    ```
 
-4. Run a restart drill.
+4. Run the current 5k offered-load benchmark profile.
 
    ```powershell
-   ./scripts/chaos/restart-processor.ps1 -Rate 1000 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
+   ./scripts/load-test/benchmark.ps1 -Rate 5000 -ProducerCount 4 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -MaxInFlight 1024 -TenantCount 50 -SourcesPerTenant 200
    ```
 
-5. Run the replay and rebuild drill.
+5. Run a restart drill.
+
+   ```powershell
+   ./scripts/chaos/restart-processor.ps1 -Rate 300 -DurationSeconds 45 -WarmupSeconds 5 -ProcessorReplicas 3
+   ```
+
+6. Run the replay and rebuild drill.
 
    ```powershell
    ./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 90
    ```
 
-6. Validate the asynchronous contract.
+7. Validate the asynchronous contract and evidence summary.
 
    ```powershell
    npm install
    npm run contract:validate
+   npm run evidence:validate
    ```
 
 ## Local auth
@@ -184,5 +190,6 @@ asyncapi.yaml
 
 - Redis caching is not part of the current hot path; PostgreSQL remains the only operational read store.
 - Azure dashboard deployment and published Azure benchmark evidence are still follow-on work.
-- The benchmark harness is credible for local evidence, but local producer throughput is currently the next limiting factor.
-- The local date-partitioned archive scanned `498,706` records to replay `25` in the latest drill, so production-scale replay needs tenant/time indexing or object-prefix partitioning.
+- The MVP `5,000 eps` target is not met yet. The latest local 5k offered-load run accepted `955.91 eps` and processed `329.37 eps`.
+- The local date-partitioned archive scanned `670,695` records to replay `25` in the latest drill, so production-scale replay needs tenant/time indexing or object-prefix partitioning.
+- Controlled recovery drills pass at sustainable rates; overload drills are still useful, but should be documented as degraded-mode evidence rather than success evidence.

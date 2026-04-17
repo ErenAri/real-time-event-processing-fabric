@@ -519,7 +519,8 @@ try {
         verifier_duplicate_before_rebuild      = [int64][Math]::Round($verifierDuplicateBeforeRebuild, 0)
         verifier_duplicate_after_rebuild       = [int64][Math]::Round($verifierDuplicateAfterRebuild, 0)
         verifier_duplicate_delta_after_rebuild = [int64][Math]::Round($verifierDuplicateAfterRebuild - $verifierDuplicateBeforeRebuild, 0)
-        rebuild_restored                       = ($processedAfterReset -eq 0 -and $sourceEventsAfterReset -eq 0 -and $processedAfterRebuild -eq $EventCount -and $sourceEventsAfterRebuild -eq $EventCount -and ($verifierProcessedAfterRebuild - $verifierProcessedBeforeRebuild) -ge $rebuildReplayedCount)
+        rebuild_restored                       = ($processedAfterReset -eq 0 -and $sourceEventsAfterReset -eq 0 -and $processedAfterRebuild -eq $EventCount -and $sourceEventsAfterRebuild -eq $EventCount)
+        rebuild_processed_by_verifier          = (($verifierProcessedAfterRebuild - $verifierProcessedBeforeRebuild) -ge $rebuildReplayedCount)
         verifier_log                           = $verifierLogPath
     }
 
@@ -539,6 +540,17 @@ try {
     Write-Host ("Rebuild response replayed       : {0}" -f $report.rebuild_replay_response_replayed)
     Write-Host ("Rebuild processed delta         : {0}" -f $report.verifier_processed_delta_after_rebuild)
     Write-Host ("Rebuild restored                : {0}" -f $report.rebuild_restored)
+    Write-Host ("Rebuild processed by verifier   : {0}" -f $report.rebuild_processed_by_verifier)
+
+    $evidenceScript = Join-Path $repoRoot "scripts/evidence/update-evidence.ps1"
+    if (Test-Path $evidenceScript) {
+        try {
+            & $evidenceScript | Out-Null
+        }
+        catch {
+            Write-Warning "Replay drill completed, but evidence summary refresh failed: $($_.Exception.Message)"
+        }
+    }
 }
 finally {
     if ($null -ne $verifier) {

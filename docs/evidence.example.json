@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-17T19:52:42Z",
+  "status": "available",
+  "artifact_root": "artifacts",
+  "benchmark": {
+    "artifact": "artifacts/benchmarks/benchmark-20260417-222710.json",
+    "started_at_utc": "2026-04-17T19:28:04Z",
+    "completed_at_utc": "2026-04-17T19:29:08Z",
+    "target_eps": 5000,
+    "accepted_eps": 955.91,
+    "processed_eps": 329.37,
+    "query_p95_ms": 147.13,
+    "peak_lag": 10969,
+    "producer_count": 4,
+    "processor_replicas": 3,
+    "summary": "Accepted 955.9 eps and processed 329.4 eps against a 5,000 eps target using 4 producers and 3 processor replicas.",
+    "gaps": [
+      "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck."
+    ]
+  },
+  "failure_drills": [
+    {
+      "scenario_id": "restart-processor",
+      "title": "Processor restart",
+      "status": "verified",
+      "artifact": "artifacts/failure-drills/restart-processor-20260417-225121.json",
+      "started_at_utc": "2026-04-17T19:51:42Z",
+      "completed_at_utc": "2026-04-17T19:52:26Z",
+      "result": "Lag recovered in 6.29 seconds.",
+      "operator_note": "Consumer group recovery is observable through lag, processed delta, and replica count.",
+      "remaining_gap": "Repeat at higher load and replica counts.",
+      "metrics": [
+        {
+          "label": "accepted delta",
+          "value": "12,000"
+        },
+        {
+          "label": "processed delta",
+          "value": "8,238"
+        },
+        {
+          "label": "peak lag",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "scenario_id": "broker-outage",
+      "title": "Broker outage",
+      "status": "verified",
+      "artifact": "artifacts/failure-drills/broker-outage-20260417-224838.json",
+      "started_at_utc": "2026-04-17T19:49:02Z",
+      "completed_at_utc": "2026-04-17T19:49:52Z",
+      "result": "Archive accounting gap 0; accepted traffic recovered: True.",
+      "operator_note": "Publish failures are explicit, and the processor remains live while Kafka is unavailable.",
+      "remaining_gap": "Client-side timeout counts still require log parsing before they are first-class evidence.",
+      "metrics": [
+        {
+          "label": "accepted delta",
+          "value": "14,152"
+        },
+        {
+          "label": "publish failed",
+          "value": "4,008"
+        },
+        {
+          "label": "peak lag",
+          "value": "0"
+        }
+      ]
+    }
+  ]
+}

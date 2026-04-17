@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"pulsestream/internal/auth"
+	"pulsestream/internal/evidence"
 	"pulsestream/internal/platform"
 	"pulsestream/internal/store"
 )
@@ -182,5 +185,83 @@ func TestQueryHandlerEmitsEmptyArraysInsteadOfNull(t *testing.T) {
 	}
 	if value, ok := rejectionsBody["rejections"].([]any); !ok || value == nil {
 		t.Fatalf("expected rejections to be an array, got %#v", rejectionsBody["rejections"])
+	}
+}
+
+func TestQueryHandlerLoadsEvidenceSummary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "latest.json")
+	t.Setenv("EVIDENCE_REPORT_PATH", path)
+
+	payload := `{
+		"schema_version": 1,
+		"generated_at": "2026-04-16T18:00:00Z",
+		"status": "available",
+		"artifact_root": "artifacts",
+		"benchmark": {
+			"artifact": "artifacts/benchmarks/benchmark.json",
+			"started_at_utc": "2026-04-16T17:59:00Z",
+			"completed_at_utc": "2026-04-16T18:00:00Z",
+			"target_eps": 5000,
+			"accepted_eps": 4800,
+			"processed_eps": 4700,
+			"query_p95_ms": 12.5,
+			"peak_lag": 100,
+			"processor_replicas": 3,
+			"summary": "test benchmark",
+			"gaps": []
+		},
+		"failure_drills": []
+	}`
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatalf("write evidence summary: %v", err)
+	}
+
+	handler := NewQueryHandler(platform.NewLogger("test"), &fakeMetricsReader{}, nil, prometheus.NewRegistry())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/evidence/latest", nil)
+	rec := httptest.NewRecorder()
+
+	handler.handleEvidenceLatest(rec, request)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body evidence.Summary
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal evidence body: %v", err)
+	}
+	if body.Status != "available" {
+		t.Fatalf("expected available status, got %q", body.Status)
+	}
+	if body.Benchmark == nil || body.Benchmark.AcceptedEPS != 4800 {
+		t.Fatalf("expected benchmark evidence, got %#v", body.Benchmark)
+	}
+}
+
+func TestQueryHandlerEvidenceRequiresAdmin(t *testing.T) {
+	verifier, err := auth.NewVerifier("secret-value", "pulsestream-local", "pulsestream-local")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	token, err := auth.SignHS256("secret-value", auth.NewClaims(
+		auth.RoleTenantUser,
+		"tenant_01",
+		"user-1",
+		"pulsestream-local",
+		"pulsestream-local",
+		time.Now().Add(time.Hour),
+	))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	handler := NewQueryHandler(platform.NewLogger("test"), &fakeMetricsReader{}, verifier, prometheus.NewRegistry())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/evidence/latest", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.handleEvidenceLatest(rec, request)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
 	}
 }
