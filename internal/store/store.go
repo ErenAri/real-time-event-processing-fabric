@@ -25,6 +25,9 @@ const schemaLockID int64 = 2026041001
 const serviceStateStaleAfter = 15 * time.Second
 const processedEventWriteMaxAttempts = 3
 const processedEventRetryDelay = 25 * time.Millisecond
+const processorAllowedLateness = 2 * time.Minute
+
+var eventWindowSizes = []time.Duration{time.Minute, 5 * time.Minute}
 
 func New(ctx context.Context, connectionString string) (*Store, error) {
 	return NewWithAdmin(ctx, connectionString, "")
@@ -158,44 +161,45 @@ func (s *Store) UpdateServiceState(ctx context.Context, serviceName string, inst
 }
 
 func (s *Store) RecordProcessedEvent(ctx context.Context, event events.TelemetryEvent) (bool, error) {
-	bucket := event.Timestamp.UTC().Truncate(10 * time.Second)
-	okCount, warnCount, errorCount := statusCounts(event.Status)
+	result, err := s.RecordProcessedEventBatch(ctx, []ProcessedEventInput{{Event: event}})
+	if err != nil {
+		return false, err
+	}
+	return result.RecordedCount == 1, nil
+}
 
+func (s *Store) RecordProcessedEventBatch(ctx context.Context, inputs []ProcessedEventInput) (ProcessedEventBatchResult, error) {
+	if len(inputs) == 0 {
+		return ProcessedEventBatchResult{}, nil
+	}
 	for attempt := 1; attempt <= processedEventWriteMaxAttempts; attempt++ {
-		recorded, err := s.recordProcessedEventOnce(ctx, event, bucket, okCount, warnCount, errorCount)
+		result, err := s.recordProcessedEventBatchOnce(ctx, inputs)
 		if err == nil {
-			return recorded, nil
+			return result, nil
 		}
 		if ctx.Err() != nil {
-			return false, ctx.Err()
+			return ProcessedEventBatchResult{}, ctx.Err()
 		}
 		if !isRetryableProcessedEventError(err) || attempt == processedEventWriteMaxAttempts {
-			return false, fmt.Errorf("record processed event: %w", err)
+			return ProcessedEventBatchResult{}, fmt.Errorf("record processed event batch: %w", err)
 		}
 
 		timer := time.NewTimer(time.Duration(attempt) * processedEventRetryDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return false, ctx.Err()
+			return ProcessedEventBatchResult{}, ctx.Err()
 		case <-timer.C:
 		}
 	}
 
-	return false, fmt.Errorf("record processed event: exhausted retry budget")
+	return ProcessedEventBatchResult{}, fmt.Errorf("record processed event batch: exhausted retry budget")
 }
 
-func (s *Store) recordProcessedEventOnce(
-	ctx context.Context,
-	event events.TelemetryEvent,
-	bucket time.Time,
-	okCount int64,
-	warnCount int64,
-	errorCount int64,
-) (bool, error) {
+func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []ProcessedEventInput) (ProcessedEventBatchResult, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, fmt.Errorf("begin transaction: %w", err)
+		return ProcessedEventBatchResult{}, fmt.Errorf("begin transaction: %w", err)
 	}
 
 	committed := false
@@ -205,68 +209,186 @@ func (s *Store) recordProcessedEventOnce(
 		}
 	}()
 
-	claimTag, err := tx.Exec(
+	result := ProcessedEventBatchResult{}
+	eventIDs := make([]string, 0, len(inputs))
+	tenantIDs := make([]string, 0, len(inputs))
+	processedAt := make([]time.Time, 0, len(inputs))
+	now := time.Now().UTC()
+	for _, input := range inputs {
+		eventIDs = append(eventIDs, input.Event.EventID)
+		tenantIDs = append(tenantIDs, input.Event.TenantID)
+		processedAt = append(processedAt, now)
+	}
+
+	stageStart := time.Now()
+	rows, err := tx.Query(
 		ctx,
 		`INSERT INTO processed_events (event_id, tenant_id, processed_at)
-		 VALUES ($1, $2, NOW())
-		 ON CONFLICT (event_id) DO NOTHING`,
-		event.EventID,
-		event.TenantID,
+		 SELECT event_id, tenant_id, processed_at
+		 FROM unnest($1::text[], $2::text[], $3::timestamptz[]) AS rows(event_id, tenant_id, processed_at)
+		 ON CONFLICT (event_id) DO NOTHING
+		 RETURNING event_id`,
+		eventIDs,
+		tenantIDs,
+		processedAt,
 	)
 	if err != nil {
-		return false, fmt.Errorf("claim processed event: %w", err)
+		return ProcessedEventBatchResult{}, fmt.Errorf("claim processed event batch: %w", err)
 	}
-	if claimTag.RowsAffected() == 0 {
-		return false, nil
+	claimedRemaining := map[string]int64{}
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			rows.Close()
+			return ProcessedEventBatchResult{}, fmt.Errorf("scan processed event claim: %w", err)
+		}
+		claimedRemaining[eventID]++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return ProcessedEventBatchResult{}, fmt.Errorf("claim processed event rows: %w", err)
+	}
+	rows.Close()
+	result.StageDurations.DedupClaimMS = durationMS(time.Since(stageStart))
+
+	tenantAggregates := map[tenantMetricKey]metricAggregate{}
+	sourceAggregates := map[sourceMetricKey]metricAggregate{}
+	windowAggregates := map[windowMetricKey]metricAggregate{}
+
+	for _, input := range inputs {
+		if claimedRemaining[input.Event.EventID] <= 0 {
+			result.DuplicateCount++
+			continue
+		}
+		claimedRemaining[input.Event.EventID]--
+
+		if input.Late {
+			result.LateCount++
+			continue
+		}
+
+		eventTime := input.Event.Timestamp.UTC()
+		okCount, warnCount, errorCount := statusCounts(input.Event.Status)
+		aggregate := metricAggregate{
+			EventsCount: 1,
+			OKCount:     okCount,
+			WarnCount:   warnCount,
+			ErrorCount:  errorCount,
+			ValueSum:    input.Event.Value,
+			LastEventAt: eventTime,
+		}
+		addAggregate(tenantAggregates, tenantMetricKey{
+			BucketStart: eventTime.Truncate(10 * time.Second),
+			TenantID:    input.Event.TenantID,
+		}, aggregate)
+		addAggregate(sourceAggregates, sourceMetricKey{
+			TenantID: input.Event.TenantID,
+			SourceID: input.Event.SourceID,
+		}, aggregate)
+		for _, windowSize := range eventWindowSizes {
+			addAggregate(windowAggregates, windowMetricKey{
+				WindowSizeSeconds: int(windowSize.Seconds()),
+				WindowStart:       eventTime.Truncate(windowSize),
+				TenantID:          input.Event.TenantID,
+				SourceID:          input.Event.SourceID,
+			}, aggregate)
+		}
+		result.RecordedCount++
 	}
 
-	_, err = tx.Exec(
-		ctx,
-		`INSERT INTO tenant_metrics (
-		     bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
-		 )
-		 VALUES ($1, $2, 1, $3, $4, $5, $6, $7)
-		 ON CONFLICT (bucket_start, tenant_id)
-		 DO UPDATE SET
-		     events_count = tenant_metrics.events_count + 1,
-		     ok_count = tenant_metrics.ok_count + EXCLUDED.ok_count,
-		     warn_count = tenant_metrics.warn_count + EXCLUDED.warn_count,
-		     error_count = tenant_metrics.error_count + EXCLUDED.error_count,
-		     value_sum = tenant_metrics.value_sum + EXCLUDED.value_sum,
-		     last_event_at = GREATEST(tenant_metrics.last_event_at, EXCLUDED.last_event_at)`,
-		bucket,
-		event.TenantID,
-		okCount,
-		warnCount,
-		errorCount,
-		event.Value,
-		event.Timestamp.UTC(),
-	)
-	if err != nil {
-		return false, fmt.Errorf("upsert tenant metrics: %w", err)
+	stageStart = time.Now()
+	for key, aggregate := range tenantAggregates {
+		_, err = tx.Exec(
+			ctx,
+			`INSERT INTO tenant_metrics (
+			     bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
+			 )
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 ON CONFLICT (bucket_start, tenant_id)
+			 DO UPDATE SET
+			     events_count = tenant_metrics.events_count + EXCLUDED.events_count,
+			     ok_count = tenant_metrics.ok_count + EXCLUDED.ok_count,
+			     warn_count = tenant_metrics.warn_count + EXCLUDED.warn_count,
+			     error_count = tenant_metrics.error_count + EXCLUDED.error_count,
+			     value_sum = tenant_metrics.value_sum + EXCLUDED.value_sum,
+			     last_event_at = GREATEST(tenant_metrics.last_event_at, EXCLUDED.last_event_at)`,
+			key.BucketStart,
+			key.TenantID,
+			aggregate.EventsCount,
+			aggregate.OKCount,
+			aggregate.WarnCount,
+			aggregate.ErrorCount,
+			aggregate.ValueSum,
+			aggregate.LastEventAt,
+		)
+		if err != nil {
+			return ProcessedEventBatchResult{}, fmt.Errorf("upsert tenant metrics: %w", err)
+		}
 	}
+	result.StageDurations.TenantAggregateMS = durationMS(time.Since(stageStart))
 
-	_, err = tx.Exec(
-		ctx,
-		`INSERT INTO source_metrics (tenant_id, source_id, events_count, last_event_at)
-		 VALUES ($1, $2, 1, $3)
-		 ON CONFLICT (tenant_id, source_id)
-		 DO UPDATE SET
-		     events_count = source_metrics.events_count + 1,
-		     last_event_at = GREATEST(source_metrics.last_event_at, EXCLUDED.last_event_at)`,
-		event.TenantID,
-		event.SourceID,
-		event.Timestamp.UTC(),
-	)
-	if err != nil {
-		return false, fmt.Errorf("upsert source metrics: %w", err)
+	stageStart = time.Now()
+	for key, aggregate := range sourceAggregates {
+		_, err = tx.Exec(
+			ctx,
+			`INSERT INTO source_metrics (tenant_id, source_id, events_count, last_event_at)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (tenant_id, source_id)
+			 DO UPDATE SET
+			     events_count = source_metrics.events_count + EXCLUDED.events_count,
+			     last_event_at = GREATEST(source_metrics.last_event_at, EXCLUDED.last_event_at)`,
+			key.TenantID,
+			key.SourceID,
+			aggregate.EventsCount,
+			aggregate.LastEventAt,
+		)
+		if err != nil {
+			return ProcessedEventBatchResult{}, fmt.Errorf("upsert source metrics: %w", err)
+		}
 	}
+	result.StageDurations.SourceAggregateMS = durationMS(time.Since(stageStart))
 
+	stageStart = time.Now()
+	for key, aggregate := range windowAggregates {
+		_, err = tx.Exec(
+			ctx,
+			`INSERT INTO event_windows (
+			     window_size_seconds, window_start, tenant_id, source_id,
+			     events_count, ok_count, warn_count, error_count, value_sum, max_event_at
+			 )
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 ON CONFLICT (window_size_seconds, window_start, tenant_id, source_id)
+			 DO UPDATE SET
+			     events_count = event_windows.events_count + EXCLUDED.events_count,
+			     ok_count = event_windows.ok_count + EXCLUDED.ok_count,
+			     warn_count = event_windows.warn_count + EXCLUDED.warn_count,
+			     error_count = event_windows.error_count + EXCLUDED.error_count,
+			     value_sum = event_windows.value_sum + EXCLUDED.value_sum,
+			     max_event_at = GREATEST(event_windows.max_event_at, EXCLUDED.max_event_at)`,
+			key.WindowSizeSeconds,
+			key.WindowStart,
+			key.TenantID,
+			key.SourceID,
+			aggregate.EventsCount,
+			aggregate.OKCount,
+			aggregate.WarnCount,
+			aggregate.ErrorCount,
+			aggregate.ValueSum,
+			aggregate.LastEventAt,
+		)
+		if err != nil {
+			return ProcessedEventBatchResult{}, fmt.Errorf("upsert event windows: %w", err)
+		}
+	}
+	result.StageDurations.WindowAggregateMS = durationMS(time.Since(stageStart))
+
+	stageStart = time.Now()
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit processed event transaction: %w", err)
+		return ProcessedEventBatchResult{}, fmt.Errorf("commit processed event transaction: %w", err)
 	}
 	committed = true
-	return true, nil
+	result.StageDurations.CommitMS = durationMS(time.Since(stageStart))
+	return result, nil
 }
 
 func isRetryableProcessedEventError(err error) bool {
@@ -281,6 +403,49 @@ func isRetryableProcessedEventError(err error) bool {
 	default:
 		return false
 	}
+}
+
+type tenantMetricKey struct {
+	BucketStart time.Time
+	TenantID    string
+}
+
+type sourceMetricKey struct {
+	TenantID string
+	SourceID string
+}
+
+type windowMetricKey struct {
+	WindowSizeSeconds int
+	WindowStart       time.Time
+	TenantID          string
+	SourceID          string
+}
+
+type metricAggregate struct {
+	EventsCount int64
+	OKCount     int64
+	WarnCount   int64
+	ErrorCount  int64
+	ValueSum    float64
+	LastEventAt time.Time
+}
+
+func addAggregate[K comparable](target map[K]metricAggregate, key K, value metricAggregate) {
+	current := target[key]
+	current.EventsCount += value.EventsCount
+	current.OKCount += value.OKCount
+	current.WarnCount += value.WarnCount
+	current.ErrorCount += value.ErrorCount
+	current.ValueSum += value.ValueSum
+	if current.LastEventAt.IsZero() || value.LastEventAt.After(current.LastEventAt) {
+		current.LastEventAt = value.LastEventAt
+	}
+	target[key] = current
+}
+
+func durationMS(value time.Duration) float64 {
+	return float64(value.Microseconds()) / 1000.0
 }
 
 func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
@@ -321,6 +486,9 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 			GeneratedAt:      time.Now().UTC(),
 			ProcessedTotal:   processedTotal,
 			EventsPerSecond:  float64(processedLastMinute) / 60.0,
+			WindowSizes:      []string{time.Minute.String(), (5 * time.Minute).String()},
+			AllowedLateness:  processorAllowedLateness.String(),
+			PartitionHealth:  []PartitionState{},
 			RecentRejections: ensureRecentRejectionsSlice(rejections),
 		}
 		if processedLastMinute > 0 {
@@ -334,6 +502,7 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 		}
 		if processor := aggregateProcessorStates(states["stream-processor"]); processor.LastSeenAt != nil {
 			overview.DuplicateTotal = processor.DuplicateTotal
+			overview.LateEventTotal = processor.LateEventTotal
 			overview.DeadLetterTotal = processor.DeadLetterTotal
 			overview.ConsumerLag = processor.ConsumerLag
 			overview.ProcessorInstances = processor.InstanceCount
@@ -342,6 +511,9 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 			overview.ProcessingP50MS = processor.ProcessingP50MS
 			overview.ProcessingP95MS = processor.ProcessingP95MS
 			overview.ProcessingP99MS = processor.ProcessingP99MS
+			overview.BatchSizeP95 = processor.BatchSizeP95
+			overview.BatchFlushP95MS = processor.BatchFlushP95MS
+			overview.PartitionHealth = ensurePartitionStateSlice(processor.Partitions)
 			overview.ProcessorLastSeenAt = processor.LastSeenAt
 		}
 
@@ -351,6 +523,110 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 		return Overview{}, err
 	}
 	return overview, nil
+}
+
+func (s *Store) GetEventWindows(
+	ctx context.Context,
+	tenantID string,
+	sourceID string,
+	windowSize time.Duration,
+	lookback time.Duration,
+) ([]WindowBucket, error) {
+	if windowSize <= 0 {
+		windowSize = time.Minute
+	}
+	if lookback <= 0 {
+		lookback = 15 * time.Minute
+	}
+	windowSizeSeconds := int(windowSize.Seconds())
+
+	var buckets []WindowBucket
+	err := s.withScopedQuerier(ctx, func(q dbQuerier) error {
+		var rows pgx.Rows
+		var err error
+		if strings.TrimSpace(sourceID) == "" {
+			rows, err = q.Query(
+				ctx,
+				`SELECT
+				     window_start,
+				     tenant_id,
+				     '' AS source_id,
+				     COALESCE(SUM(events_count), 0),
+				     COALESCE(SUM(ok_count), 0),
+				     COALESCE(SUM(warn_count), 0),
+				     COALESCE(SUM(error_count), 0),
+				     CASE WHEN COALESCE(SUM(events_count), 0) = 0 THEN 0 ELSE COALESCE(SUM(value_sum), 0) / SUM(events_count) END,
+				     COALESCE(MAX(max_event_at), window_start),
+				     EXTRACT(EPOCH FROM (NOW() - COALESCE(MAX(max_event_at), window_start))) * 1000
+				 FROM event_windows
+				 WHERE tenant_id = $1
+				   AND window_size_seconds = $2
+				   AND window_start >= NOW() - $3::interval
+				 GROUP BY window_start, tenant_id
+				 ORDER BY window_start ASC`,
+				tenantID,
+				windowSizeSeconds,
+				formatInterval(lookback),
+			)
+		} else {
+			rows, err = q.Query(
+				ctx,
+				`SELECT
+				     window_start,
+				     tenant_id,
+				     source_id,
+				     events_count,
+				     ok_count,
+				     warn_count,
+				     error_count,
+				     CASE WHEN events_count = 0 THEN 0 ELSE value_sum / events_count END,
+				     max_event_at,
+				     EXTRACT(EPOCH FROM (NOW() - max_event_at)) * 1000
+				 FROM event_windows
+				 WHERE tenant_id = $1
+				   AND source_id = $2
+				   AND window_size_seconds = $3
+				   AND window_start >= NOW() - $4::interval
+				 ORDER BY window_start ASC`,
+				tenantID,
+				sourceID,
+				windowSizeSeconds,
+				formatInterval(lookback),
+			)
+		}
+		if err != nil {
+			return fmt.Errorf("query event windows: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var bucket WindowBucket
+			if err := rows.Scan(
+				&bucket.WindowStart,
+				&bucket.TenantID,
+				&bucket.SourceID,
+				&bucket.EventsCount,
+				&bucket.OKCount,
+				&bucket.WarnCount,
+				&bucket.ErrorCount,
+				&bucket.Average,
+				&bucket.MaxEventAt,
+				&bucket.FreshnessMS,
+			); err != nil {
+				return fmt.Errorf("scan event window: %w", err)
+			}
+			bucket.WindowSize = windowSize.String()
+			buckets = append(buckets, bucket)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if buckets == nil {
+		return []WindowBucket{}, nil
+	}
+	return buckets, nil
 }
 
 func (s *Store) GetTenantSeries(ctx context.Context, tenantID string, window time.Duration) ([]TenantBucket, error) {
@@ -589,6 +865,13 @@ func ensureRecentRejectionsSlice(rejections []RecentRejection) []RecentRejection
 		return []RecentRejection{}
 	}
 	return rejections
+}
+
+func ensurePartitionStateSlice(partitions []PartitionState) []PartitionState {
+	if partitions == nil {
+		return []PartitionState{}
+	}
+	return partitions
 }
 
 func formatInterval(value time.Duration) string {

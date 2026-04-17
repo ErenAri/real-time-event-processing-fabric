@@ -191,6 +191,29 @@ function Stop-BenchmarkContainers {
     }
 }
 
+function Stop-ActiveLoadGenerators {
+    param(
+        [string]$Mode,
+        [object[]]$Processes,
+        [object[]]$ProducerRuns
+    )
+
+    if ($Mode -eq "local") {
+        foreach ($process in @($Processes)) {
+            if ($null -ne $process -and -not $process.HasExited) {
+                Stop-Process -Id $process.Id -Force
+            }
+        }
+        return
+    }
+
+    foreach ($producer in @($ProducerRuns)) {
+        if ($producer.mode -eq "compose" -and (Test-ContainerExists -Name $producer.name)) {
+            docker stop $producer.name | Out-Null
+        }
+    }
+}
+
 function Stop-ComposeSimulator {
     param([string]$ComposeFilePath)
 
@@ -275,6 +298,49 @@ function Get-PrometheusInstantValue {
     return [double]$results[0].value[1]
 }
 
+function Get-StageLatencySummary {
+    param([string]$PrometheusBaseUrl)
+
+    $stages = @(
+        "dedup_claim",
+        "tenant_aggregate_upsert",
+        "source_aggregate_upsert",
+        "window_aggregate_upsert",
+        "db_transaction_commit",
+        "kafka_offset_commit"
+    )
+    $summary = [ordered]@{}
+    foreach ($stage in $stages) {
+        $safeStage = $stage.Replace('"', '\"')
+        $summary[$stage] = [ordered]@{
+            p50_ms = [Math]::Round((Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "histogram_quantile(0.50, sum(rate(pulsestream_processor_stage_duration_seconds_bucket{stage=`"$safeStage`"}[2m])) by (le)) * 1000"), 2)
+            p95_ms = [Math]::Round((Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "histogram_quantile(0.95, sum(rate(pulsestream_processor_stage_duration_seconds_bucket{stage=`"$safeStage`"}[2m])) by (le)) * 1000"), 2)
+            p99_ms = [Math]::Round((Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "histogram_quantile(0.99, sum(rate(pulsestream_processor_stage_duration_seconds_bucket{stage=`"$safeStage`"}[2m])) by (le)) * 1000"), 2)
+        }
+    }
+    return $summary
+}
+
+function Get-IngestLatencySummary {
+    param([string]$PrometheusBaseUrl)
+
+    $histograms = [ordered]@{
+        validation = "pulsestream_ingest_validation_duration_seconds_bucket"
+        archive_write = "pulsestream_ingest_archive_duration_seconds_bucket"
+        kafka_publish = "pulsestream_ingest_publish_duration_seconds_bucket"
+    }
+    $summary = [ordered]@{}
+    foreach ($stage in $histograms.Keys) {
+        $metric = $histograms[$stage]
+        $summary[$stage] = [ordered]@{
+            p50_ms = [Math]::Round((Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "histogram_quantile(0.50, sum(rate($metric[2m])) by (le)) * 1000"), 2)
+            p95_ms = [Math]::Round((Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "histogram_quantile(0.95, sum(rate($metric[2m])) by (le)) * 1000"), 2)
+            p99_ms = [Math]::Round((Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "histogram_quantile(0.99, sum(rate($metric[2m])) by (le)) * 1000"), 2)
+        }
+    }
+    return $summary
+}
+
 function Wait-PrometheusQueryValue {
     param(
         [string]$BaseUrl,
@@ -323,6 +389,32 @@ function Wait-PrometheusQueryExactValue {
     }
 
     return $false
+}
+
+function Measure-PostLoadDrain {
+    param(
+        [string]$PrometheusBaseUrl,
+        [int64]$TargetLag,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $lag = [int64](Get-PrometheusInstantValue -BaseUrl $PrometheusBaseUrl -Query "sum(pulsestream_processor_consumer_lag)")
+            if ($lag -le $TargetLag) {
+                $stopwatch.Stop()
+                return [Math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    $stopwatch.Stop()
+    return [Math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
 }
 
 function Get-OverviewSample {
@@ -491,6 +583,7 @@ $startSample = $null
 $endSample = $null
 $startMetrics = $null
 $endMetrics = $null
+$postLoadDrainSeconds = 0
 $reportPath = $OutputPath
 $producerStdoutPath = Get-ProducerStdoutPath -Index 1
 $producerStderrPath = Get-ProducerStderrPath -Index 1
@@ -499,7 +592,7 @@ try {
     if ($ProcessorReplicas -gt 0 -and $ProcessorReplicas -ne $originalProcessorReplicas) {
         Write-Host "Scaling stream-processor to $ProcessorReplicas replicas..."
         $restoreProcessorReplicas = $originalProcessorReplicas
-        docker compose -f $ComposeFile up -d --scale stream-processor=$ProcessorReplicas stream-processor prometheus | Out-Null
+        docker compose -f $ComposeFile up -d --no-deps --scale stream-processor=$ProcessorReplicas stream-processor prometheus | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to scale stream-processor."
         }
@@ -666,9 +759,10 @@ try {
         Start-Sleep -Milliseconds $SampleIntervalMilliseconds
     }
 
-    Start-Sleep -Seconds 2
     $endMetrics = Get-ServiceMetricsSnapshot -PrometheusBaseUrl $PrometheusEndpoint
     $endSample = Get-BenchmarkSample -OverviewUrl $OverviewEndpoint -PrometheusBaseUrl $PrometheusEndpoint -Token $BearerToken
+    Stop-ActiveLoadGenerators -Mode $ProducerMode -Processes $loadProcesses -ProducerRuns $producerRuns
+    $postLoadDrainSeconds = Measure-PostLoadDrain -PrometheusBaseUrl $PrometheusEndpoint -TargetLag ([int64]$startMetrics.processor.consumer_lag)
 }
 finally {
     if ($ProducerMode -eq "local") {
@@ -695,7 +789,7 @@ finally {
 
     if ($null -ne $restoreProcessorReplicas -and $restoreProcessorReplicas -ge 0) {
         try {
-            docker compose -f $ComposeFile up -d --scale stream-processor=$restoreProcessorReplicas stream-processor prometheus | Out-Null
+            docker compose -f $ComposeFile up -d --no-deps --scale stream-processor=$restoreProcessorReplicas stream-processor prometheus | Out-Null
         }
         catch {
             Write-Warning "Failed to restore the original stream-processor replica count."
@@ -766,6 +860,12 @@ $offeredToAcceptedRatio = 0
 if ($producerSentDelta -gt 0) {
     $offeredToAcceptedRatio = [Math]::Round(($acceptedDelta / [double]$producerSentDelta), 4)
 }
+$benchmarkGates = @(
+    [ordered]@{ name = "processed_eps_2000"; status = if ($processedEPS -ge 2000) { "pass" } else { "fail" }; target = 2000; observed = $processedEPS; unit = "eps" }
+    [ordered]@{ name = "processed_eps_5000"; status = if ($processedEPS -ge 5000) { "pass" } else { "fail" }; target = 5000; observed = $processedEPS; unit = "eps" }
+    [ordered]@{ name = "query_p95_250ms"; status = if ([Math]::Round((Get-Percentile -Values $queryLatencies -Percentile 95), 2) -le 250) { "pass" } else { "fail" }; target = 250; observed = [Math]::Round((Get-Percentile -Values $queryLatencies -Percentile 95), 2); unit = "ms" }
+    [ordered]@{ name = "post_load_drain_30s"; status = if ($postLoadDrainSeconds -le 30) { "pass" } else { "fail" }; target = 30; observed = $postLoadDrainSeconds; unit = "s" }
+)
 
 $report = [ordered]@{
     producer_mode               = $ProducerMode
@@ -804,9 +904,13 @@ $report = [ordered]@{
     peak_processing_p50_ms      = $peakP50
     peak_processing_p95_ms      = $peakP95
     peak_processing_p99_ms      = $peakP99
+    post_load_drain_seconds     = $postLoadDrainSeconds
+    ingest_stage_latency_ms     = Get-IngestLatencySummary -PrometheusBaseUrl $PrometheusEndpoint
+    stage_latency_ms            = Get-StageLatencySummary -PrometheusBaseUrl $PrometheusEndpoint
     query_latency_p50_ms        = [Math]::Round((Get-Percentile -Values $queryLatencies -Percentile 50), 2)
     query_latency_p95_ms        = [Math]::Round((Get-Percentile -Values $queryLatencies -Percentile 95), 2)
     query_latency_p99_ms        = [Math]::Round((Get-Percentile -Values $queryLatencies -Percentile 99), 2)
+    gates                       = $benchmarkGates
     sample_count                = $samples.Count
     producer_stdout_log         = $producerStdoutPath
     producer_stderr_log         = $producerStderrPath
@@ -843,6 +947,7 @@ Write-Host ("Peak in-flight      : {0}" -f $report.peak_inflight_messages)
 Write-Host ("Peak P95 ms         : {0}" -f $report.peak_processing_p95_ms)
 Write-Host ("Peak P99 ms         : {0}" -f $report.peak_processing_p99_ms)
 Write-Host ("Query P95 ms        : {0}" -f $report.query_latency_p95_ms)
+Write-Host ("Post-load drain s   : {0}" -f $report.post_load_drain_seconds)
 Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | {7} | {8} producers, mode {9}, replicas {10}, max_in_flight/producer {11} |" -f `
     (Get-Date -Format "yyyy-MM-dd"), `
     $Rate, `

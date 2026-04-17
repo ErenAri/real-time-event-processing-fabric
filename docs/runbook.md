@@ -119,7 +119,7 @@ Invoke-RestMethod `
   -Body '{"start_date":"2026-04-10","tenant_id":"tenant_01","limit":500}'
 ```
 
-The archive is stored in the ingest container at `/var/lib/pulsestream/archive` and on the host through the `archive-data` Docker volume.
+The archive is stored in the ingest container at `/var/lib/pulsestream/archive` and on the host through the `archive-data` Docker volume. New records use `year/month/day/tenant_id/hour/events.ndjson`; replay still falls back to the legacy `year/month/day/events.ndjson` layout for older artifacts.
 
 Use the scripted replay drill when you need repeatable evidence that replay is duplicate-safe and can rebuild scoped hot views:
 
@@ -145,6 +145,7 @@ The drill creates a unique sentinel tenant, verifies the first replay is discard
    ```
 
 4. Compare `accepted_total` and `processed_total` in `GET /api/v1/metrics/overview`.
+5. Query `GET /api/v1/metrics/partitions` to identify hot partitions, owner processor instances, and partition-level in-flight work.
 
 ## Investigate rejection spikes
 

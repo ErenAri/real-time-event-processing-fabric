@@ -38,6 +38,17 @@ function validateMetric(metric, context) {
   }
 }
 
+function validateGate(gate, context) {
+  assert(isObject(gate), `${context} must be an object`);
+  requireString(gate, "name", context);
+  requireString(gate, "status", context);
+  requireNumber(gate, "target", context);
+  requireNumber(gate, "observed", context);
+  if ("unit" in gate) {
+    requireString(gate, "unit", context);
+  }
+}
+
 function validateBenchmark(benchmark, context) {
   assert(isObject(benchmark), `${context} must be an object`);
   requireString(benchmark, "artifact", context);
@@ -48,6 +59,7 @@ function validateBenchmark(benchmark, context) {
   requireNumber(benchmark, "processed_eps", context);
   requireNumber(benchmark, "query_p95_ms", context);
   requireNumber(benchmark, "peak_lag", context);
+  requireNumber(benchmark, "post_load_drain_seconds", context);
   requireNumber(benchmark, "producer_count", context);
   requireNumber(benchmark, "processor_replicas", context);
   requireString(benchmark, "summary", context);
@@ -55,6 +67,8 @@ function validateBenchmark(benchmark, context) {
   benchmark.gaps.forEach((gap, index) => {
     assert(typeof gap === "string", `${context}.gaps[${index}] must be a string`);
   });
+  assert(Array.isArray(benchmark.gates), `${context}.gates must be an array`);
+  benchmark.gates.forEach((gate, index) => validateGate(gate, `${context}.gates[${index}]`));
 }
 
 function validateDrill(drill, context) {

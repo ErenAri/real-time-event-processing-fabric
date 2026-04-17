@@ -12,6 +12,7 @@ export interface Overview {
   rejected_total: number;
   processed_total: number;
   duplicate_total: number;
+  late_event_total: number;
   dead_letter_total: number;
   consumer_lag: number;
   processor_instances: number;
@@ -22,6 +23,11 @@ export interface Overview {
   processing_p50_ms: number;
   processing_p95_ms: number;
   processing_p99_ms: number;
+  batch_size_p95: number;
+  batch_flush_p95_ms: number;
+  window_sizes: string[];
+  allowed_lateness: string;
+  partition_health: PartitionState[];
   ingest_last_seen_at?: string;
   processor_last_seen_at?: string;
   recent_rejections: RecentRejection[];
@@ -40,6 +46,46 @@ export interface TenantSeriesResponse {
   tenant_id: string;
   window: string;
   series: TenantBucket[];
+}
+
+export interface WindowBucket {
+  window_start: string;
+  window_size: string;
+  tenant_id: string;
+  source_id?: string;
+  events_count: number;
+  ok_count: number;
+  warn_count: number;
+  error_count: number;
+  average_value: number;
+  max_event_at: string;
+  freshness_ms: number;
+}
+
+export interface WindowResponse {
+  tenant_id: string;
+  source_id: string;
+  window_size: string;
+  lookback: string;
+  semantic: string;
+  windows: WindowBucket[];
+}
+
+export interface PartitionState {
+  partition: number;
+  owner_instance_id?: string;
+  lag: number;
+  processed_total: number;
+  duplicate_total: number;
+  late_event_total: number;
+  inflight_messages: number;
+  last_offset: number;
+  last_seen_at: string;
+}
+
+export interface PartitionResponse {
+  generated_at: string;
+  partitions: PartitionState[];
 }
 
 export interface SourceMetric {
@@ -97,10 +143,20 @@ export interface BenchmarkEvidence {
   processed_eps: number;
   query_p95_ms: number;
   peak_lag: number;
+  post_load_drain_seconds: number;
   producer_count: number;
   processor_replicas: number;
   summary: string;
   gaps: string[];
+  gates: EvidenceGate[];
+}
+
+export interface EvidenceGate {
+  name: string;
+  status: string;
+  target: number;
+  observed: number;
+  unit?: string;
 }
 
 export interface FailureDrillEvidence {

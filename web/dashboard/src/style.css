@@ -501,6 +501,34 @@ button:disabled {
   grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
+.gate-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.gate-chip {
+  border-radius: 999px;
+  border: 1px solid rgba(111, 173, 190, 0.18);
+  padding: 7px 10px;
+  color: #d7ebe9;
+  background: rgba(111, 173, 190, 0.12);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.gate-chip.pass {
+  color: #88f4d3;
+  border-color: rgba(96, 214, 202, 0.3);
+  background: rgba(30, 136, 112, 0.18);
+}
+
+.gate-chip.fail {
+  color: #ffc4bc;
+  border-color: rgba(255, 107, 91, 0.32);
+  background: rgba(129, 34, 24, 0.24);
+}
+
 .evidence-metrics {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 12px;
@@ -558,6 +586,35 @@ button:disabled {
 
 .alignment-row span {
   color: #d7ebe9;
+}
+
+.partition-list {
+  display: grid;
+  gap: 10px;
+}
+
+.partition-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) repeat(3, minmax(80px, 0.8fr));
+  gap: 10px;
+  align-items: stretch;
+  padding: 12px;
+  border-radius: 18px;
+  background: rgba(5, 22, 30, 0.58);
+  border: 1px solid rgba(111, 173, 190, 0.12);
+}
+
+.partition-row > div:first-child {
+  display: grid;
+  align-content: center;
+  gap: 4px;
+}
+
+.partition-row span {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .timeline {
@@ -629,7 +686,8 @@ button:disabled {
   .replay-result,
   .evidence-benchmark-metrics,
   .evidence-metrics,
-  .evidence-grid {
+  .evidence-grid,
+  .partition-row {
     grid-template-columns: 1fr;
   }
 

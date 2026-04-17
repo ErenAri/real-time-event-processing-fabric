@@ -116,6 +116,20 @@ CREATE TABLE IF NOT EXISTS source_metrics (
     PRIMARY KEY (tenant_id, source_id)
 );
 
+CREATE TABLE IF NOT EXISTS event_windows (
+    window_size_seconds INTEGER NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    tenant_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    events_count BIGINT NOT NULL DEFAULT 0,
+    ok_count BIGINT NOT NULL DEFAULT 0,
+    warn_count BIGINT NOT NULL DEFAULT 0,
+    error_count BIGINT NOT NULL DEFAULT 0,
+    value_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+    max_event_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (window_size_seconds, window_start, tenant_id, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS rejection_events (
     id BIGSERIAL PRIMARY KEY,
     reason TEXT NOT NULL,
@@ -153,6 +167,12 @@ CREATE INDEX IF NOT EXISTS idx_tenant_metrics_tenant_bucket
 
 CREATE INDEX IF NOT EXISTS idx_source_metrics_events
     ON source_metrics (events_count DESC);
+
+CREATE INDEX IF NOT EXISTS idx_event_windows_tenant_window
+    ON event_windows (tenant_id, window_size_seconds, window_start DESC);
+
+CREATE INDEX IF NOT EXISTS idx_event_windows_source_window
+    ON event_windows (tenant_id, source_id, window_size_seconds, window_start DESC);
 
 CREATE INDEX IF NOT EXISTS idx_rejection_events_created_at
     ON rejection_events (created_at DESC);
@@ -208,6 +228,20 @@ CREATE POLICY source_metrics_access ON source_metrics
         OR tenant_id = current_setting('app.tenant_id', true)
     );
 
+ALTER TABLE event_windows ENABLE ROW LEVEL SECURITY;
+ALTER TABLE event_windows FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS event_windows_access ON event_windows;
+CREATE POLICY event_windows_access ON event_windows
+    FOR ALL TO %s
+    USING (
+        current_setting('app.role', true) IN ('service', 'admin')
+        OR tenant_id = current_setting('app.tenant_id', true)
+    )
+    WITH CHECK (
+        current_setting('app.role', true) IN ('service', 'admin')
+        OR tenant_id = current_setting('app.tenant_id', true)
+    );
+
 ALTER TABLE rejection_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rejection_events FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS rejection_events_access ON rejection_events;
@@ -229,6 +263,7 @@ CREATE POLICY service_state_access ON service_state
     FOR ALL TO %s
     USING (current_setting('app.role', true) IN ('service', 'admin'))
     WITH CHECK (current_setting('app.role', true) IN ('service', 'admin'));`,
+		role,
 		role,
 		role,
 		role,

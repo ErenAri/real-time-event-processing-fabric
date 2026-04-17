@@ -115,11 +115,11 @@ func TestAzureBlobArchiveRoundTripReplay(t *testing.T) {
 		t.Fatalf("close archive: %v", err)
 	}
 
-	if len(store.uploads) != 1 {
-		t.Fatalf("expected one uploaded blob, got %d", len(store.uploads))
+	if len(store.uploads) != 2 {
+		t.Fatalf("expected two uploaded blobs, got %d", len(store.uploads))
 	}
 	for blobName := range store.uploads {
-		if !strings.HasPrefix(blobName, "raw/2026/04/10/events-") {
+		if !strings.HasPrefix(blobName, "raw/2026/04/10/tenant_") {
 			t.Fatalf("unexpected blob name %q", blobName)
 		}
 	}
