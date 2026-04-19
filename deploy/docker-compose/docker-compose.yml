@@ -145,13 +145,14 @@ services:
       SIM_INGEST_ENDPOINT: http://ingest-service:8080/api/v1/events
       SIM_BEARER_TOKEN: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4iLCJpc3MiOiJwdWxzZXN0cmVhbS1sb2NhbCIsInN1YiI6ImxvY2FsLWFkbWluIiwiYXVkIjpbInB1bHNlc3RyZWFtLWxvY2FsIl0sImV4cCI6MjA5MTI3ODUwNiwiaWF0IjoxNzc1OTE4NTA2fQ.q__74RIQsNpC5AfZY6yr-6dwTAP8gybP2_4kB5NQ-Vs
       SIMULATOR_LISTEN_ADDR: :8083
-      SIM_RATE_PER_SEC: 1000
+      SIM_RATE_PER_SEC: 300
       SIM_TENANT_COUNT: 5
       SIM_SOURCES_PER_TENANT: 25
+      SIM_MAX_IN_FLIGHT: 128
       SIM_DUPLICATE_EVERY: 250
       SIM_MALFORMED_EVERY: 500
       SIM_BURST_EVERY: 30s
-      SIM_BURST_SIZE: 200
+      SIM_BURST_SIZE: 50
     depends_on:
       ingest-service:
         condition: service_started

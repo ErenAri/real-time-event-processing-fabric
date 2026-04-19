@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -297,7 +298,18 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 	}
 
 	stageStart = time.Now()
-	for key, aggregate := range tenantAggregates {
+	tenantKeys := make([]tenantMetricKey, 0, len(tenantAggregates))
+	for key := range tenantAggregates {
+		tenantKeys = append(tenantKeys, key)
+	}
+	sort.Slice(tenantKeys, func(i, j int) bool {
+		if tenantKeys[i].BucketStart.Equal(tenantKeys[j].BucketStart) {
+			return tenantKeys[i].TenantID < tenantKeys[j].TenantID
+		}
+		return tenantKeys[i].BucketStart.Before(tenantKeys[j].BucketStart)
+	})
+	for _, key := range tenantKeys {
+		aggregate := tenantAggregates[key]
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO tenant_metrics (
@@ -328,7 +340,18 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 	result.StageDurations.TenantAggregateMS = durationMS(time.Since(stageStart))
 
 	stageStart = time.Now()
-	for key, aggregate := range sourceAggregates {
+	sourceKeys := make([]sourceMetricKey, 0, len(sourceAggregates))
+	for key := range sourceAggregates {
+		sourceKeys = append(sourceKeys, key)
+	}
+	sort.Slice(sourceKeys, func(i, j int) bool {
+		if sourceKeys[i].TenantID == sourceKeys[j].TenantID {
+			return sourceKeys[i].SourceID < sourceKeys[j].SourceID
+		}
+		return sourceKeys[i].TenantID < sourceKeys[j].TenantID
+	})
+	for _, key := range sourceKeys {
+		aggregate := sourceAggregates[key]
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO source_metrics (tenant_id, source_id, events_count, last_event_at)
@@ -349,7 +372,24 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 	result.StageDurations.SourceAggregateMS = durationMS(time.Since(stageStart))
 
 	stageStart = time.Now()
-	for key, aggregate := range windowAggregates {
+	windowKeys := make([]windowMetricKey, 0, len(windowAggregates))
+	for key := range windowAggregates {
+		windowKeys = append(windowKeys, key)
+	}
+	sort.Slice(windowKeys, func(i, j int) bool {
+		if windowKeys[i].WindowSizeSeconds != windowKeys[j].WindowSizeSeconds {
+			return windowKeys[i].WindowSizeSeconds < windowKeys[j].WindowSizeSeconds
+		}
+		if !windowKeys[i].WindowStart.Equal(windowKeys[j].WindowStart) {
+			return windowKeys[i].WindowStart.Before(windowKeys[j].WindowStart)
+		}
+		if windowKeys[i].TenantID != windowKeys[j].TenantID {
+			return windowKeys[i].TenantID < windowKeys[j].TenantID
+		}
+		return windowKeys[i].SourceID < windowKeys[j].SourceID
+	})
+	for _, key := range windowKeys {
+		aggregate := windowAggregates[key]
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO event_windows (
