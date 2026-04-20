@@ -46,7 +46,15 @@ The most recent local artifacts were captured on:
    docker compose -f deploy/docker-compose/docker-compose.yml up --build
    ```
 
-2. Run a benchmark.
+2. Run the current performance gate.
+
+   ```powershell
+   ./scripts/load-test/run-performance-gate.ps1 -Rate 2000 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -ProducerCount 4 -MaxInFlight 768 -TenantCount 50 -SourcesPerTenant 200
+   ```
+
+   Use `-AllowGateFailure` when you want a bottleneck artifact even if the gate fails. Use `-ResetVolumes` only when you deliberately want to remove Kafka, PostgreSQL, and Prometheus state before the run.
+
+3. Run a custom benchmark.
 
    ```powershell
    ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
@@ -58,7 +66,7 @@ The most recent local artifacts were captured on:
    ./scripts/load-test/benchmark.ps1 -Rate 5000 -ProducerCount 4 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -MaxInFlight 1024 -TenantCount 50 -SourcesPerTenant 200
    ```
 
-3. Review the generated JSON artifact under `artifacts/benchmarks/`.
+4. Review the generated JSON artifact under `artifacts/benchmarks/`.
 
 The harness:
 
@@ -74,6 +82,13 @@ The harness:
 - records requested and observed processor replica counts
 - writes explicit pass/fail gates for processed eps, query p95, and drain time
 - refreshes `artifacts/evidence/latest.json` so the dashboard and `GET /api/v1/evidence/latest` show the latest benchmark evidence
+
+The gate wrapper adds:
+
+- stack startup with one retry for transient Compose dependency-health races
+- optional volume reset
+- evidence schema validation
+- non-zero exit when gates fail, unless `-AllowGateFailure` is set
 
 ## Metrics captured
 
@@ -101,15 +116,16 @@ The harness:
 | 2026-04-10 | 1500 | 33s | 713.09 | 568.43 | 14 | 23 | 1308 | exact-count harness, `1` processor replica, artifact `artifacts/benchmarks/benchmark-20260410-212955.json` |
 | 2026-04-10 | 1500 | 33s | 700.37 | 595.02 | 11 | 19 | 1246 | exact-count harness, `3` processor replicas, artifact `artifacts/benchmarks/benchmark-20260410-213110.json` |
 | 2026-04-17 | 5000 | 63.1s | 955.91 | 329.37 | 243 | 432 | 10969 | `4` producers, `3` processor replicas, `50` tenants, `200` sources per tenant, artifact `artifacts/benchmarks/benchmark-20260417-222710.json`; target not met |
+| 2026-04-20 | 2000 | 60.77s | 717.1 | 495.08 | 336 | 2997 | 5114 | performance gate wrapper, `4` producers, `3` processor replicas, `50` tenants, `200` sources per tenant, artifact `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json`; target not met |
 
 ## MVP gate status
 
 | Gate | Target | Current result | Status |
 | --- | --- | --- | --- |
-| Intermediate throughput | sustain `2,000 processed eps` locally | latest published evidence is `329.37 processed eps`; rerun required after batch processor change | Not met |
-| MVP throughput | sustain `5,000 processed eps` locally | latest published evidence is `329.37 processed eps`; rerun required after batch processor change | Not met |
-| Query latency | dashboard/API p95 below refresh interval | overview query p95 `147.13 ms` in the latest 5k offered-load run | Met for current load |
-| Post-load drain | lag returns to pre-run level within `30s` | new harness records this; old artifact did not | Needs rerun |
+| Intermediate throughput | sustain `2,000 processed eps` locally | latest gate processed `495.08 eps` | Not met |
+| MVP throughput | sustain `5,000 processed eps` locally | latest gate processed `495.08 eps` | Not met |
+| Query latency | dashboard/API p95 below `250 ms` | latest gate query p95 was `265.82 ms` | Not met |
+| Post-load drain | lag returns to pre-run level within `30s` | latest gate drained in `39.53s` | Not met |
 | Processor recovery | consumer restart recovers without data loss at sustainable rate | restart drill recovered lag in `6.29s` at `300 eps` with `3` processor replicas | Met at controlled rate |
 | Broker failure accounting | publish failures visible and archive accounting closed | broker outage had archive accounting gap `0` and accepted traffic recovered in `2.09s` | Met |
 | Replay/idempotency | replay does not overcount hot views | `25` duplicate replays produced `0` source-metric overcount; rebuild restored hot views | Met |
@@ -141,20 +157,33 @@ The committed example is `docs/evidence.example.json`. Runtime artifacts remain 
 
 ## Interpretation
 
-- The processor hot path now uses bounded per-partition batches. Published evidence predates that change and must be regenerated before making a new throughput claim.
+- The processor hot path uses bounded per-partition batches, and the latest 2k gate still fails. Do not claim the 2k target is met.
 - Multi-producer generation prevents a single simulator process from being the only limiter, and `SIM_PRODUCER_ID` prevents synthetic `event_id` collisions across producers.
-- The latest published 5k offered-load run still fails the throughput gate. Accepted throughput is below 20 percent of target and processed throughput is below 10 percent of target.
-- Query latency is not the current bottleneck. The latest run kept overview query p95 at `147.13 ms`.
+- The latest 2k gate accepted only `717.1 eps` from an offered `2,000 eps`, and benchmark producers reported `269.46 failed eps`. Ingest and producer-side pressure remain part of the bottleneck.
+- Query latency is now also close to the gate boundary. The latest 2k gate had overview query p95 of `265.82 ms`, above the `250 ms` threshold.
 - Backpressure rejections are now metric-only instead of being written to PostgreSQL rejection rows, which avoids amplifying database load during overload.
 - Poison-message handling is verified separately in `artifacts/failure-drills/inject-poison-message-20260417-193308.json` so malformed direct-to-Kafka records can be tested without distorting the hot benchmark stream.
+- Processor scale-out exposed a startup DDL deadlock in schema initialization. The fix adds a schema migration marker plus retry around PostgreSQL deadlock and serialization errors so additional processor replicas do not repeatedly run the full DDL block.
 
 ## Current bottleneck
 
-The next performance limitation is not solely the processor. The local high-rate path is constrained by producer/client timeouts, ingest publish/archive pressure, Kafka write behavior under load, and PostgreSQL hot-view writes. The benchmark evidence is useful because it shows where the system fails, but it should not be presented as a 5k eps success.
+The next performance limitation is not solely the processor. The latest 2k gate shows producer/client failures, ingest archive and Kafka publish latency, and PostgreSQL hot-view writes all contributing.
+
+Measured slow stages from `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json`:
+
+- Ingest archive write: `p95 3827.14 ms`
+- Ingest Kafka publish: `p95 2149.53 ms`
+- Processor tenant aggregate upsert: `p95 7843.38 ms`
+- Processor window aggregate upsert: `p95 1869.98 ms`
+- Processor dedup claim: `p95 334.03 ms`
+
+The benchmark evidence is useful because it shows where the system fails, but it should not be presented as a 2k or 5k eps success.
 
 The next defensible benchmark step is one of:
 
-- profile ingest request handling and Kafka writer flush behavior under the `5,000 eps` offered-load run
+- move raw archive writes out of the synchronous ingest request path, or batch/async them with explicit durability tradeoffs
+- reduce tenant/window aggregate write amplification in PostgreSQL, likely with larger grouped upserts or a staging-table merge
+- profile Kafka writer flush behavior under the `2,000 eps` offered-load run
 - profile processor PostgreSQL write latency and batch behavior under sustained backlog
-- rerun the `5,000 eps` profile after batching and compare stage histograms before making any improvement claim
+- rerun the `2,000 eps` profile after each optimization and compare stage histograms before making any improvement claim
 - run the same profile on stronger local hardware or a cloud deployment where producer, broker, and database capacity can be scaled independently

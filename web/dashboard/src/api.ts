@@ -75,6 +75,8 @@ function normalizeOverview(payload: Overview): Overview {
     accepted_total: asNumber(payload?.accepted_total),
     rejected_total: asNumber(payload?.rejected_total),
     processed_total: asNumber(payload?.processed_total),
+    stored_processed_total: asNumber(payload?.stored_processed_total, asNumber(payload?.processed_total)),
+    processor_processed_total: asNumber(payload?.processor_processed_total),
     duplicate_total: asNumber(payload?.duplicate_total),
     late_event_total: asNumber(payload?.late_event_total),
     dead_letter_total: asNumber(payload?.dead_letter_total),

@@ -60,6 +60,16 @@ Prometheus uses Docker service discovery, so it should discover the new processo
 
 ## Run a benchmark
 
+Use the gate wrapper for publishable throughput evidence:
+
+```powershell
+./scripts/load-test/run-performance-gate.ps1 -Rate 2000 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -ProducerCount 4 -MaxInFlight 768 -TenantCount 50 -SourcesPerTenant 200
+```
+
+The wrapper starts the stack, optionally supports `-ResetVolumes`, pauses the steady simulator, runs `benchmark.ps1`, refreshes `artifacts/evidence/latest.json`, validates the evidence schema, and returns a non-zero exit code when a gate fails. Use `-AllowGateFailure` when the goal is to capture a bottleneck artifact rather than pass CI.
+
+Use the lower-level harness when you need a custom profile:
+
 ```powershell
 ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
 ```
@@ -72,7 +82,7 @@ Run the current 5k offered-load profile when you need to reproduce the known thr
 ./scripts/load-test/benchmark.ps1 -Rate 5000 -ProducerCount 4 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -MaxInFlight 1024 -TenantCount 50 -SourcesPerTenant 200
 ```
 
-The latest run of that profile accepted `955.91 eps` and processed `329.37 eps`, so it is a bottleneck artifact rather than a passing MVP result.
+The latest 2k gate run accepted `717.1 eps` and processed `495.08 eps`; query p95 was `265.82 ms` and post-load drain was `39.53s`. It is current bottleneck evidence, not a passing throughput result.
 
 ## Run a restart drill
 
@@ -144,7 +154,7 @@ The drill creates a unique sentinel tenant, verifies the first replay is discard
    docker compose -f deploy/docker-compose/docker-compose.yml logs stream-processor
    ```
 
-4. Compare `accepted_total` and `processed_total` in `GET /api/v1/metrics/overview`.
+4. Compare `accepted_total` with `processor_processed_total` in `GET /api/v1/metrics/overview` for same-process progress. Use `stored_processed_total` only for persisted hot-view totals because it can include previous local runs when volumes are reused.
 5. Query `GET /api/v1/metrics/partitions` to identify hot partitions, owner processor instances, and partition-level in-flight work.
 
 ## Investigate rejection spikes

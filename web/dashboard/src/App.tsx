@@ -44,6 +44,8 @@ const emptyOverview: Overview = {
   accepted_total: 0,
   rejected_total: 0,
   processed_total: 0,
+  stored_processed_total: 0,
+  processor_processed_total: 0,
   duplicate_total: 0,
   late_event_total: 0,
   dead_letter_total: 0,
@@ -291,7 +293,7 @@ export default function App() {
   const processorFreshness = serviceFreshness(overview.processor_last_seen_at);
   const acceptedVsProcessed =
     overview.accepted_total > 0
-      ? Math.min(100, (overview.processed_total / overview.accepted_total) * 100)
+      ? Math.min(100, (overview.processor_processed_total / overview.accepted_total) * 100)
       : 0;
 
   async function handleTenantSubmit(event: FormEvent) {
@@ -378,9 +380,9 @@ export default function App() {
           detail={`Rejected ${formatNumber(overview.rejected_total)}`}
         />
         <MetricCard
-          label="Processed"
-          value={formatNumber(overview.processed_total)}
-          detail={`${formatNumber(acceptedVsProcessed, 1)}% of accepted; late skipped ${formatNumber(overview.late_event_total)}`}
+          label="Processor count"
+          value={formatNumber(overview.processor_processed_total)}
+          detail={`${formatNumber(acceptedVsProcessed, 1)}% of accepted in current service processes`}
         />
         <MetricCard
           label="Throughput"
@@ -461,6 +463,8 @@ export default function App() {
             <StatRow label="Batch P95" value={`${formatNumber(overview.batch_flush_p95_ms, 2)} ms`} />
             <StatRow label="Batch size P95" value={formatNumber(overview.batch_size_p95, 0)} />
             <StatRow label="Processor replicas" value={formatNumber(overview.processor_instances)} />
+            <StatRow label="Hot-view processed total" value={formatNumber(overview.stored_processed_total)} />
+            <StatRow label="Late skipped" value={formatNumber(overview.late_event_total)} />
             <StatRow label="Dead-lettered" value={formatNumber(overview.dead_letter_total)} />
             <StatRow label="Active partitions" value={formatNumber(overview.processor_active_partitions)} />
             <StatRow label="Ingest last seen" value={formatTime(overview.ingest_last_seen_at)} />

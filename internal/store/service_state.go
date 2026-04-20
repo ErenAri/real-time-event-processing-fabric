@@ -23,6 +23,7 @@ func aggregateIngestStates(states []stateEnvelope) IngestState {
 }
 
 type processorAggregate struct {
+	ProcessedTotal   int64
 	DuplicateTotal   int64
 	LateEventTotal   int64
 	DeadLetterTotal  int64
@@ -48,6 +49,7 @@ func aggregateProcessorStates(states []stateEnvelope) processorAggregate {
 		}
 
 		aggregate.InstanceCount++
+		aggregate.ProcessedTotal += state.Processor.ProcessedTotal
 		aggregate.DuplicateTotal += state.Processor.DuplicateTotal
 		aggregate.LateEventTotal += state.Processor.LateEventTotal
 		aggregate.DeadLetterTotal += state.Processor.DeadLetterTotal

@@ -11,6 +11,7 @@
 | PostgreSQL pause or slowdown | `./scripts/chaos/pause-postgres.ps1` | processor write path degrades and recovers after Postgres resumes | verified in `artifacts/failure-drills/pause-postgres-20260417-224710.json` |
 | Broker outage | `./scripts/chaos/broker-outage.ps1` | publish failures become visible; processor survives broker loss | verified in `artifacts/failure-drills/broker-outage-20260417-224838.json` |
 | Replay and rebuild | `./scripts/chaos/replay-archive.ps1` | archived events are republished, duplicates are ignored, and scoped hot views can be rebuilt | verified in `artifacts/failure-drills/replay-archive-20260417193652.json` |
+| Processor scale-out during startup | `docker compose ... --scale stream-processor=3` | replicas start without rerunning intrusive DDL or deadlocking schema setup | defect found during 2k gate; fixed with schema migration marker and retry, but needs a dedicated drill artifact |
 
 ## Evidence automation
 
@@ -29,6 +30,14 @@ npm run evidence:validate
 ```
 
 The purpose is not to hide raw data. The summary gives the dashboard a stable contract while keeping the raw drill artifact as the source of truth.
+
+## Startup and scale-out defect found during QE
+
+- Trigger: the 2k performance gate scaled `stream-processor` from `1` to `3` replicas before load.
+- Observed failure before fix: new replicas exited with `ensure schema: ERROR: deadlock detected (SQLSTATE 40P01)`.
+- Root cause: every service startup reran the full schema DDL block. During scale-out this could conflict with live service-state writes and startup DDL from other replicas.
+- Mitigation implemented: schema initialization now records a `schema_migrations` marker and skips already-applied DDL. It also retries PostgreSQL deadlock and serialization failures during schema ensure.
+- Remaining evidence gap: this was validated as part of the subsequent benchmark setup, but it should become a dedicated startup/scale-out drill artifact before claiming formal recovery coverage.
 
 ## Processor restart during load
 

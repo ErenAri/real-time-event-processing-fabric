@@ -47,6 +47,7 @@ func TestAggregateProcessorStates(t *testing.T) {
 		{
 			InstanceID: "processor-1",
 			Processor: &ProcessorState{
+				ProcessedTotal:   100,
 				DuplicateTotal:   11,
 				DeadLetterTotal:  2,
 				ConsumerLag:      350,
@@ -61,6 +62,7 @@ func TestAggregateProcessorStates(t *testing.T) {
 		{
 			InstanceID: "processor-2",
 			Processor: &ProcessorState{
+				ProcessedTotal:   250,
 				DuplicateTotal:   5,
 				DeadLetterTotal:  1,
 				ConsumerLag:      125,
@@ -76,6 +78,9 @@ func TestAggregateProcessorStates(t *testing.T) {
 
 	if aggregate.InstanceCount != 2 {
 		t.Fatalf("instance count mismatch: got %d want %d", aggregate.InstanceCount, 2)
+	}
+	if aggregate.ProcessedTotal != 350 {
+		t.Fatalf("processed total mismatch: got %d want %d", aggregate.ProcessedTotal, 350)
 	}
 	if aggregate.DuplicateTotal != 16 {
 		t.Fatalf("duplicate total mismatch: got %d want %d", aggregate.DuplicateTotal, 16)

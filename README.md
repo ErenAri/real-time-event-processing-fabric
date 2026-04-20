@@ -66,6 +66,7 @@ flowchart LR
 
 | Scenario | Artifact | Summary |
 | --- | --- | --- |
+| 2k performance gate | `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json` | `4` producers, `3` processors, target `2,000 eps`; observed `717.1 accepted eps`, `495.08 processed eps`, query `p95 265.82 ms`, drain `39.53s`; target not met |
 | 5k offered-load benchmark | `artifacts/benchmarks/benchmark-20260417-222710.json` | `4` producers, `3` processors, target `5,000 eps`; observed `955.91 accepted eps`, `329.37 processed eps`, query `p95 147.13 ms`, peak lag `10,969`; target not met |
 | Processor restart drill | `artifacts/failure-drills/restart-processor-20260417-225121.json` | `3` processors, `300 eps`; one replica restarted, lag recovered in `6.29s`, final lag `0` |
 | Broker outage drill | `artifacts/failure-drills/broker-outage-20260417-224838.json` | `10s` Kafka outage, archive accounting gap `0`, accepted traffic recovered in `2.09s`, `4,008` explicit publish failures |
@@ -73,7 +74,7 @@ flowchart LR
 | Replay and rebuild drill | `artifacts/failure-drills/replay-archive-20260417193652.json` | `25` duplicate replays produced `0` source-metric overcount; scoped hot-view reset rebuilt processed/source counts back to `25` |
 | Poison-message drill | `artifacts/failure-drills/inject-poison-message-20260417-193308.json` | malformed Kafka record produced `dead_letter_delta: 1` without blocking the processor loop |
 
-Current local evidence is deliberately conservative. Recovery behavior is verified at sustainable rates, but the MVP `5,000 eps` throughput target is not yet met on this machine. The current bottleneck is the local write path under high offered load: producer/client timeouts, ingest publish/archive pressure, and PostgreSQL hot-view writes limit accepted and processed throughput before the dashboard/API layer becomes the bottleneck.
+Current local evidence is deliberately conservative. Recovery behavior is verified at sustainable rates, but the intermediate `2,000 processed eps` gate and MVP `5,000 eps` throughput target are not yet met on this machine. The current bottleneck is the local write path under high offered load: producer/client timeouts, ingest publish/archive pressure, and PostgreSQL hot-view writes limit accepted and processed throughput. The latest 2k gate also pushed overview query p95 above the `250 ms` target.
 
 ## Quick start
 
@@ -91,31 +92,37 @@ Current local evidence is deliberately conservative. Recovery behavior is verifi
    - Prometheus: `http://localhost:9090`
    - Grafana: `http://localhost:3000` with `admin` / `admin`
 
-3. Run a benchmark.
+3. Run the current performance gate.
+
+   ```powershell
+   ./scripts/load-test/run-performance-gate.ps1 -Rate 2000 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -ProducerCount 4 -MaxInFlight 768 -TenantCount 50 -SourcesPerTenant 200
+   ```
+
+4. Run a custom benchmark.
 
    ```powershell
    ./scripts/load-test/benchmark.ps1 -Rate 1500 -DurationSeconds 30 -WarmupSeconds 5 -ProcessorReplicas 3
    ```
 
-4. Run the current 5k offered-load benchmark profile.
+5. Run the current 5k offered-load benchmark profile.
 
    ```powershell
    ./scripts/load-test/benchmark.ps1 -Rate 5000 -ProducerCount 4 -DurationSeconds 60 -WarmupSeconds 10 -ProcessorReplicas 3 -MaxInFlight 1024 -TenantCount 50 -SourcesPerTenant 200
    ```
 
-5. Run a restart drill.
+6. Run a restart drill.
 
    ```powershell
    ./scripts/chaos/restart-processor.ps1 -Rate 300 -DurationSeconds 45 -WarmupSeconds 5 -ProcessorReplicas 3
    ```
 
-6. Run the replay and rebuild drill.
+7. Run the replay and rebuild drill.
 
    ```powershell
    ./scripts/chaos/replay-archive.ps1 -EventCount 25 -WaitTimeoutSeconds 90
    ```
 
-7. Validate the asynchronous contract and evidence summary.
+8. Validate the asynchronous contract and evidence summary.
 
    ```powershell
    npm install
@@ -192,6 +199,6 @@ asyncapi.yaml
 
 - Redis caching is not part of the current hot path; PostgreSQL remains the only operational read store.
 - Azure dashboard deployment and published Azure benchmark evidence are still follow-on work.
-- The MVP `5,000 eps` target is not met yet. The latest published local 5k offered-load run accepted `955.91 eps` and processed `329.37 eps`; the next gate is `2,000 processed eps` after the batching change.
+- The intermediate `2,000 processed eps` gate is not met yet. The latest local gate accepted `717.1 eps` and processed `495.08 eps`; slow stages were ingest archive write, Kafka publish, and PostgreSQL tenant/window aggregate upserts.
 - New archive records use tenant/hour prefixes for scoped replay. Existing date-only archives are still readable, and old replay evidence remains useful as the baseline for why indexing was added.
 - Controlled recovery drills pass at sustainable rates; overload drills are still useful, but should be documented as degraded-mode evidence rather than success evidence.

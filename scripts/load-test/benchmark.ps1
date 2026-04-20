@@ -735,7 +735,7 @@ try {
     }
 
     foreach ($producer in @($producerRuns)) {
-        if ($producer.mode -eq "compose" -and $ProducerCount -gt 1) {
+        if ($producer.mode -eq "compose") {
             if (-not (Wait-ContainerHTTPReady -ContainerName $producer.name -TimeoutSeconds 20)) {
                 throw "Benchmark producer $($producer.name) did not become ready inside its container."
             }

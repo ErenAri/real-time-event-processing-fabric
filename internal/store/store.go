@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,9 @@ type Store struct {
 }
 
 const schemaLockID int64 = 2026041001
+const schemaVersion = "20260420_service_state_instances_v1"
+const schemaEnsureMaxAttempts = 3
+const schemaEnsureRetryDelay = 100 * time.Millisecond
 const serviceStateStaleAfter = 15 * time.Second
 const processedEventWriteMaxAttempts = 3
 const processedEventRetryDelay = 25 * time.Millisecond
@@ -98,6 +102,28 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 }
 
 func (s *Store) ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	for attempt := 1; attempt <= schemaEnsureMaxAttempts; attempt++ {
+		err := s.ensureSchemaOnce(ctx, pool)
+		if err == nil {
+			return nil
+		}
+		if !isRetryablePostgresError(err) || attempt == schemaEnsureMaxAttempts {
+			return err
+		}
+
+		timer := time.NewTimer(time.Duration(attempt) * schemaEnsureRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("ensure schema: exhausted retry budget")
+}
+
+func (s *Store) ensureSchemaOnce(ctx context.Context, pool *pgxpool.Pool) error {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire postgres connection for schema init: %w", err)
@@ -111,8 +137,27 @@ func (s *Store) ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, schemaLockID)
 	}()
 
+	if _, err := conn.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`); err != nil {
+		return fmt.Errorf("ensure schema migrations table: %w", err)
+	}
+
+	var applied bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, schemaVersion).Scan(&applied); err != nil {
+		return fmt.Errorf("check schema migration marker: %w", err)
+	}
+	if applied {
+		return nil
+	}
+
 	if _, err := conn.Exec(ctx, s.schemaSQL()); err != nil {
 		return fmt.Errorf("ensure schema: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, schemaVersion); err != nil {
+		return fmt.Errorf("record schema migration marker: %w", err)
 	}
 	return nil
 }
@@ -297,7 +342,18 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 	}
 
 	stageStart = time.Now()
-	for key, aggregate := range tenantAggregates {
+	tenantKeys := make([]tenantMetricKey, 0, len(tenantAggregates))
+	for key := range tenantAggregates {
+		tenantKeys = append(tenantKeys, key)
+	}
+	sort.Slice(tenantKeys, func(i, j int) bool {
+		if tenantKeys[i].BucketStart.Equal(tenantKeys[j].BucketStart) {
+			return tenantKeys[i].TenantID < tenantKeys[j].TenantID
+		}
+		return tenantKeys[i].BucketStart.Before(tenantKeys[j].BucketStart)
+	})
+	for _, key := range tenantKeys {
+		aggregate := tenantAggregates[key]
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO tenant_metrics (
@@ -328,7 +384,18 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 	result.StageDurations.TenantAggregateMS = durationMS(time.Since(stageStart))
 
 	stageStart = time.Now()
-	for key, aggregate := range sourceAggregates {
+	sourceKeys := make([]sourceMetricKey, 0, len(sourceAggregates))
+	for key := range sourceAggregates {
+		sourceKeys = append(sourceKeys, key)
+	}
+	sort.Slice(sourceKeys, func(i, j int) bool {
+		if sourceKeys[i].TenantID == sourceKeys[j].TenantID {
+			return sourceKeys[i].SourceID < sourceKeys[j].SourceID
+		}
+		return sourceKeys[i].TenantID < sourceKeys[j].TenantID
+	})
+	for _, key := range sourceKeys {
+		aggregate := sourceAggregates[key]
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO source_metrics (tenant_id, source_id, events_count, last_event_at)
@@ -349,7 +416,24 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 	result.StageDurations.SourceAggregateMS = durationMS(time.Since(stageStart))
 
 	stageStart = time.Now()
-	for key, aggregate := range windowAggregates {
+	windowKeys := make([]windowMetricKey, 0, len(windowAggregates))
+	for key := range windowAggregates {
+		windowKeys = append(windowKeys, key)
+	}
+	sort.Slice(windowKeys, func(i, j int) bool {
+		if windowKeys[i].WindowSizeSeconds != windowKeys[j].WindowSizeSeconds {
+			return windowKeys[i].WindowSizeSeconds < windowKeys[j].WindowSizeSeconds
+		}
+		if !windowKeys[i].WindowStart.Equal(windowKeys[j].WindowStart) {
+			return windowKeys[i].WindowStart.Before(windowKeys[j].WindowStart)
+		}
+		if windowKeys[i].TenantID != windowKeys[j].TenantID {
+			return windowKeys[i].TenantID < windowKeys[j].TenantID
+		}
+		return windowKeys[i].SourceID < windowKeys[j].SourceID
+	})
+	for _, key := range windowKeys {
+		aggregate := windowAggregates[key]
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO event_windows (
@@ -392,6 +476,10 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 }
 
 func isRetryableProcessedEventError(err error) bool {
+	return isRetryablePostgresError(err)
+}
+
+func isRetryablePostgresError(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return false
@@ -483,13 +571,14 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 		}
 
 		overview = Overview{
-			GeneratedAt:      time.Now().UTC(),
-			ProcessedTotal:   processedTotal,
-			EventsPerSecond:  float64(processedLastMinute) / 60.0,
-			WindowSizes:      []string{time.Minute.String(), (5 * time.Minute).String()},
-			AllowedLateness:  processorAllowedLateness.String(),
-			PartitionHealth:  []PartitionState{},
-			RecentRejections: ensureRecentRejectionsSlice(rejections),
+			GeneratedAt:          time.Now().UTC(),
+			ProcessedTotal:       processedTotal,
+			StoredProcessedTotal: processedTotal,
+			EventsPerSecond:      float64(processedLastMinute) / 60.0,
+			WindowSizes:          []string{time.Minute.String(), (5 * time.Minute).String()},
+			AllowedLateness:      processorAllowedLateness.String(),
+			PartitionHealth:      []PartitionState{},
+			RecentRejections:     ensureRecentRejectionsSlice(rejections),
 		}
 		if processedLastMinute > 0 {
 			overview.ErrorRate = float64(errorLastMinute) / float64(processedLastMinute)
@@ -501,6 +590,7 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 			overview.IngestLastSeenAt = &ingest.LastSeenAt
 		}
 		if processor := aggregateProcessorStates(states["stream-processor"]); processor.LastSeenAt != nil {
+			overview.ProcessorProcessedTotal = processor.ProcessedTotal
 			overview.DuplicateTotal = processor.DuplicateTotal
 			overview.LateEventTotal = processor.LateEventTotal
 			overview.DeadLetterTotal = processor.DeadLetterTotal
