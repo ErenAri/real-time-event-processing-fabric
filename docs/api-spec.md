@@ -76,6 +76,11 @@ Typical rejection:
 
 Returns platform-wide state aggregated from PostgreSQL hot views and recent service snapshots.
 
+Counter semantics:
+
+- `processed_total` and `stored_processed_total` are persisted hot-view totals from PostgreSQL. They can include previous local runs if Docker volumes are reused.
+- `accepted_total`, `rejected_total`, and `processor_processed_total` are current service-process snapshot counters. Use these for same-run dashboard ratios and benchmark smoke checks.
+
 Representative response shape:
 
 ```json
@@ -84,6 +89,8 @@ Representative response shape:
   "accepted_total": 251154,
   "rejected_total": 343,
   "processed_total": 1910754,
+  "stored_processed_total": 1910754,
+  "processor_processed_total": 250991,
   "duplicate_total": 10385,
   "late_event_total": 14,
   "dead_letter_total": 1,

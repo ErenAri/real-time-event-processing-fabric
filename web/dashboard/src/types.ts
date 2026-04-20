@@ -11,6 +11,8 @@ export interface Overview {
   accepted_total: number;
   rejected_total: number;
   processed_total: number;
+  stored_processed_total: number;
+  processor_processed_total: number;
   duplicate_total: number;
   late_event_total: number;
   dead_letter_total: number;
