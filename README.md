@@ -66,7 +66,8 @@ flowchart LR
 
 | Scenario | Artifact | Summary |
 | --- | --- | --- |
-| Latest sharded-tenant 5k benchmark | `artifacts/benchmarks/benchmark-20260423-175006.json` | `4` producers, `3` processors, batch size `25`, target `5,000 eps`; observed `4,971.03 accepted eps`, `5,101.71 processed eps`, query `p95 54.91 ms`, drain `2.05s`; MVP throughput gate met once locally |
+| Clean-state 5k repeatability set | `artifacts/benchmarks/benchmark-performance-gate-20260423-175836.json`, `artifacts/benchmarks/benchmark-performance-gate-20260423-180140.json`, `artifacts/benchmarks/benchmark-performance-gate-20260423-180442.json` | `3` clean-state 5k gate runs with batch size `25`; `2/3` runs passed `processed_eps_5000`; processed range `4,921.98` to `5,318.88 eps`, query `p95` range `127.75` to `148.38 ms`, drain range `0.01s` to `0.02s` |
+| Latest sharded-tenant 5k benchmark | `artifacts/benchmarks/benchmark-20260423-175006.json` | `4` producers, `3` processors, batch size `25`, target `5,000 eps`; observed `4,971.03 accepted eps`, `5,101.71 processed eps`, query `p95 54.91 ms`, drain `2.05s`; single-run 5k pass before clean-state repeatability check |
 | Pre-shard batch 5k benchmark | `artifacts/benchmarks/benchmark-20260423-132558.json` | `4` producers, `3` processors, batch size `25`, target `5,000 eps`; observed `4,980.08 accepted eps`, `4,962.23 processed eps`, query `p95 52.19 ms`, drain `3.59s`; MVP throughput gate narrowly not met |
 | Latest batch 2k performance gate | `artifacts/benchmarks/benchmark-performance-gate-20260423-131819.json` | `4` producers, `3` processors, batch size `25`, target `2,000 eps`; observed `1,973.53 accepted eps`, `2,030.64 processed eps`, query `p95 26.24 ms`, drain `0.01s`; intermediate throughput gate met |
 | Pre-batch 2k performance gate | `artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json` | `4` producers, `3` processors, one-event HTTP path; observed `898.67 accepted eps`, `910.44 processed eps`, query `p95 135.03 ms`, drain `2.02s`; throughput target not met |
@@ -79,7 +80,7 @@ flowchart LR
 | Replay and rebuild drill | `artifacts/failure-drills/replay-archive-20260417193652.json` | `25` duplicate replays produced `0` source-metric overcount; scoped hot-view reset rebuilt processed/source counts back to `25` |
 | Poison-message drill | `artifacts/failure-drills/inject-poison-message-20260417-193308.json` | malformed Kafka record produced `dead_letter_delta: 1` without blocking the processor loop |
 
-Current local evidence is deliberately conservative. Batch ingest met the intermediate `2,000 processed eps` gate, and sharded tenant metrics moved the `5,000 processed eps` profile from a near miss to `5,101.71 processed eps` on this machine. The 2026-04-23 fixes removed the raw archive as the dominant synchronous ingest bottleneck, reduced processor window/source write pressure, replaced one-event-per-request benchmark traffic with a production-shaped batch profile, and split tenant aggregate writes across deterministic shards. The remaining credibility gaps are repeatability and rerunning failure drills after the new batch/sharded hot path.
+Current local evidence is deliberately conservative. Batch ingest met the intermediate `2,000 processed eps` gate, and sharded tenant metrics moved the `5,000 processed eps` profile from a near miss to a `2/3` clean-state pass rate on this machine. The three clean-state 5k runs produced a processed-throughput range of `4,921.98` to `5,318.88 eps`. The 2026-04-23 fixes removed the raw archive as the dominant synchronous ingest bottleneck, reduced processor window/source write pressure, replaced one-event-per-request benchmark traffic with a production-shaped batch profile, and split tenant aggregate writes across deterministic shards. The remaining credibility gaps are repeatability and rerunning failure drills after the new batch/sharded hot path.
 
 ## Quick start
 
@@ -206,7 +207,7 @@ asyncapi.yaml
 
 - Redis caching is not part of the current hot path; PostgreSQL remains the only operational read store.
 - Azure dashboard deployment and published Azure benchmark evidence are still follow-on work.
-- The intermediate `2,000 processed eps` and MVP `5,000 processed eps` gates are met by current local batch runs. Treat the `5,101.71 processed eps` result as a single-machine local benchmark until it is repeated on clean state and cloud infrastructure.
+- The intermediate `2,000 processed eps` gate is solid locally. The MVP `5,000 processed eps` gate passed in `2` of `3` clean-state runs, with processed throughput ranging from `4,921.98` to `5,318.88 eps`. Treat this as capable but not yet fully stable local evidence.
 - Tenant aggregate writes use `tenant_metric_shards` to reduce hot-row contention. Query APIs roll these shards up with legacy `tenant_metrics` rows for read compatibility.
 - The raw archive is asynchronous in the Docker Compose benchmark profile. This improves ingest latency but means archive durability is decoupled from the HTTP response; queue depth and async write counters must be monitored.
 - The optional Kafka publish batcher is implemented behind `KAFKA_PUBLISH_BATCHER_ENABLED`, but it is disabled in the Compose profile because the 2026-04-23 local experiment regressed Kafka publish latency.
