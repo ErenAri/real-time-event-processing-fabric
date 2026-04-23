@@ -99,42 +99,43 @@ sequenceDiagram
 
 - Trigger: `./scripts/chaos/inject-poison-message.ps1` or write a malformed or semantically invalid record directly to Kafka
 - Expected behavior: processor publishes one DLQ record, commits the source offset only after the DLQ write succeeds, and increments `dead_letter_total`
-- Observed drill: `artifacts/failure-drills/inject-poison-message-20260417-193308.json`
-- Observed behavior: the scripted drill paused the compose simulator, launched a temporary processor with a fresh consumer group at the current topic tail, wrote one malformed record directly to `pulsestream.events`, and increased `dead_letter_total` by `1`
+- Observed drill: `artifacts/failure-drills/inject-poison-message-20260423-153845.json`
+- Observed behavior: after adding explicit startup bootstrap for the main Kafka topic and DLQ topic, the scripted drill paused the compose simulator, launched a temporary processor with a fresh consumer group at the current topic tail, wrote one malformed record directly to `pulsestream.events`, and increased `dead_letter_total` by `1`
 - Observed behavior: the DLQ record captured the failure reason, source topic, source offset, consumer group, and base64-encoded original payload
-- Interpretation: processor-side poison messages are isolated without blocking the consumer loop, and the operator path can see the event through both the overview API and the DLQ topic even when the main consumer group is already carrying backlog
+- Observed behavior: consumer lag remained `0` before and after the drill, and the overview API reported `2` processor instances while the temporary verifier was running
+- Interpretation: processor-side poison messages are isolated without blocking the consumer loop, and the DLQ path is no longer dependent on opportunistic topic auto-creation
 
 ## PostgreSQL pause or slowdown
 
 - Trigger: `./scripts/chaos/pause-postgres.ps1`
 - Expected behavior: processor errors become visible quickly, read paths degrade, recovery begins when Postgres resumes
-- Observed drill: `artifacts/failure-drills/pause-postgres-20260417-224710.json`
-- Observed behavior: with a `500 eps` target load and a `10s` Postgres pause, ingest accepted `20,134` events and rejected `0`
-- Observed behavior: processor progress recovered inside the observation window; `processed_total_delta` was `11,195`, `peak_processor_inflight` was `2,125`, and processing resumed `0.02s` after Postgres reported healthy
-- Observed behavior: query-service overview calls failed visibly during the pause; the drill recorded `3` overview failures and a peak overview latency of `3037.88ms`
-- Observed behavior: `publish_failed` and `backpressure` remained `0`; `p95` / `p99` processor latency peaked at `88ms` / `290ms`
-- Remaining gap: final consumer lag was `163`, so the drill verifies recovery but still shows backlog cleanup work after dependency stalls
-- Interpretation: Postgres dependency failure is measured instead of assumed; read APIs surface the dependency failure, and processor recovery resumes after the database returns
+- Observed drill: `artifacts/failure-drills/pause-postgres-20260423-182821.json`
+- Observed behavior: with a batch-size `25`, `2,000 eps` target load and a `12s` Postgres pause, ingest accepted `140,000` events and rejected `0`
+- Observed behavior: processor progress recovered inside the observation window; `processed_total_delta` was `193,538`, `peak_processor_inflight` was `4,028`, `peak_consumer_lag` reached `5,357`, and processing resumed `0.05s` after Postgres reported healthy
+- Observed behavior: query-service overview calls failed visibly during the pause; the drill recorded `3` overview failures and a peak overview latency of `3036.41ms`
+- Observed behavior: `publish_failed` and `backpressure` remained `0`; final consumer lag returned to `0`
+- Remaining gap: the drill proves recovery, but the processed counter moved faster than accepted traffic during the pause window, so the batch-path accounting model still needs tighter explanation
+- Interpretation: Postgres dependency failure is measured instead of assumed; read APIs surface the dependency failure, and the processor drains backlog again when the database returns
 
 ## Broker outage
 
 - Trigger: `./scripts/chaos/broker-outage.ps1`
 - Expected behavior: ingest publish failures become visible quickly, accepted traffic drops during the outage window, the raw archive still retains valid requests, and the processor resumes consumption after broker health returns without crashing the service
-- Observed drill: `artifacts/failure-drills/broker-outage-20260417-224838.json`
-- Observed behavior: with a `400 eps` target and a `10s` Kafka outage, the archive delta was `18,160`, accepted traffic increased by `14,152`, explicit `publish_failed` rejections increased by `4,008`, and the archive accounting gap was `0`
-- Observed behavior: Kafka health was detected during the run, accepted traffic recovered `2.09s` after the broker became ready, and final lag remained `0`
-- Observed behavior: `p95` / `p99` processing latency peaked at `28ms` / `61ms`, and the processor remained live
-- Remaining gap: client-side timeout counts are still inferred from producer logs rather than promoted into the normalized evidence schema
-- Interpretation: broker outage handling is measured through explicit failed-publish accounting and consumer survival, not just manual log inspection
+- Observed drill: `artifacts/failure-drills/broker-outage-20260423-182640.json`
+- Observed behavior: with a batch-size `25`, `2,000 eps` target and a `12s` Kafka outage, the archive delta was `110,000`, accepted traffic increased by `69,800`, explicit `publish_failed` rejections increased by `1,608`, and the archive accounting gap widened to `38,592`
+- Observed behavior: Kafka health was detected during the run, accepted traffic recovered `4.13s` after the broker became ready, and final lag remained `0`
+- Observed behavior: `p95` / `p99` processing latency peaked at `15ms` / `38ms`, and the processor remained live for the outage drill itself
+- Remaining gap: batch-path archive accounting is not yet coherent during broker disruption, so this scenario is currently degraded evidence rather than a clean resilience pass
+- Interpretation: broker outage handling is partly measured, but the ingest/archive/publish counters still disagree under failure and must be reconciled before the project can claim production-grade accounting
 
 ## Replay and rebuild
 
 - Trigger: `./scripts/chaos/replay-archive.ps1`
 - Direct endpoint: `POST /api/v1/admin/replay`
 - Expected behavior: archived events are republished to Kafka, duplicates are safely ignored by the processor, and hot views can be rebuilt from the raw archive after scoped state loss
-- Observed drill: `artifacts/failure-drills/replay-archive-20260417193652.json`
-- Observed behavior: the drill paused the compose simulator, started a temporary processor with a fresh consumer group, created a sentinel tenant with `25` accepted events, and waited until the sentinel events were processed into `processed_events` and `source_metrics`
-- Observed behavior: replaying the same tenant/date archive returned `25` replayed records; the verifier processor recorded `25` duplicate discards, `processed_events` stayed at `25`, `source_metrics` stayed at `25`, and `source_metric_overcount_delta` remained `0`
-- Observed behavior: after deleting only the sentinel tenant's `source_metrics`, `tenant_metrics`, and `processed_events` rows, replay returned `25` records again and rebuilt both `processed_events` and `source_metrics` back to `25`
-- Remaining gap: the latest published replay evidence used the legacy date-only archive and scanned `670,695` records to replay `25`. New archives are tenant/hour indexed, so this drill should be rerun to prove the scan ratio improvement.
-- Interpretation: the system has measured evidence for idempotent replay and scoped hot-view rebuild. The indexed archive layout is implemented, but benchmark evidence for replay efficiency still needs to be regenerated.
+- Observed drill: `artifacts/failure-drills/replay-archive-20260423153016.json`
+- Observed behavior: the drill paused the compose simulator, started a temporary processor with a fresh consumer group, created a sentinel tenant with `50` accepted events, and waited until the sentinel events were processed into `processed_events` and `source_metrics`
+- Observed behavior: replaying the same tenant/date archive returned `50` replayed records; the verifier processor recorded `50` duplicate discards, `processed_events` stayed at `50`, `source_metrics` stayed at `50`, and `source_metric_overcount_delta` remained `0`
+- Observed behavior: after deleting only the sentinel tenant's hot-view and dedup rows, replay returned `50` records again and rebuilt both `processed_events` and `source_metrics` back to `50`
+- Remaining gap: the rebuild verifier only observed `47` rebuilt events, so the scoped rebuild path is not yet fully verified even though the materialized state was restored. Indexed archive efficiency also still needs a fresh scan-ratio measurement.
+- Interpretation: duplicate-safe replay is measured, and scoped hot-view rebuild appears to restore state, but the isolated verifier undercount means this scenario remains degraded until replay verification is tightened

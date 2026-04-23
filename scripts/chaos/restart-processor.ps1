@@ -1,5 +1,6 @@
 param(
     [int]$Rate = 1000,
+    [int]$BatchSize = 25,
     [int]$WarmupSeconds = 5,
     [int]$DurationSeconds = 30,
     [int]$RestartAfterSeconds = 8,
@@ -25,6 +26,11 @@ if ([string]::IsNullOrWhiteSpace($BearerToken)) {
 }
 if ([string]::IsNullOrWhiteSpace($BearerToken)) {
     $BearerToken = $defaultBearerToken
+}
+
+$composeIngestEndpoint = "http://ingest-service:8080/api/v1/events"
+if ($BatchSize -gt 1 -and $composeIngestEndpoint.TrimEnd("/") -ieq "http://ingest-service:8080/api/v1/events") {
+    $composeIngestEndpoint = "http://ingest-service:8080/api/v1/events/batch"
 }
 
 function Wait-HttpReady {
@@ -327,9 +333,10 @@ try {
     docker compose -f $ComposeFile run -d `
         --name $benchmarkContainerName `
         --no-deps `
-        -e SIM_INGEST_ENDPOINT=http://ingest-service:8080/api/v1/events `
+        -e SIM_INGEST_ENDPOINT=$composeIngestEndpoint `
         -e SIM_BEARER_TOKEN=$BearerToken `
         -e SIM_RATE_PER_SEC=$Rate `
+        -e SIM_BATCH_SIZE=$BatchSize `
         -e SIM_TENANT_COUNT=5 `
         -e SIM_SOURCES_PER_TENANT=25 `
         -e SIM_MAX_IN_FLIGHT=$MaxInFlight `
@@ -454,6 +461,8 @@ $report = [ordered]@{
     started_at_utc              = $samples[0].timestamp_utc
     completed_at_utc            = $finalSample.timestamp_utc
     rate_target_eps             = $Rate
+    batch_size                  = $BatchSize
+    ingest_endpoint             = $composeIngestEndpoint
     warmup_seconds              = $WarmupSeconds
     duration_seconds            = $DurationSeconds
     restart_after_seconds       = $RestartAfterSeconds
@@ -489,6 +498,7 @@ Write-Host ""
 Write-Host "Failure drill report written to $OutputPath"
 Write-Host ("Restart target      : {0}" -f $report.restart_target_container)
 Write-Host ("Processor replicas  : {0}" -f $report.peak_processor_replicas)
+Write-Host ("Batch size          : {0}" -f $report.batch_size)
 Write-Host ("Peak lag            : {0}" -f $report.peak_consumer_lag)
 Write-Host ("Final lag           : {0}" -f $report.final_consumer_lag)
 Write-Host ("Processed delta     : {0}" -f $report.processed_total_delta)

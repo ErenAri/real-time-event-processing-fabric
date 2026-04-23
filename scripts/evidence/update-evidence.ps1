@@ -344,14 +344,15 @@ function New-DrillEvidence {
         "replay-archive" {
             $duplicateSafe = [bool](Get-PropertyValue -Object $report -Name "duplicate_safe" -Default $false)
             $rebuildRestored = [bool](Get-PropertyValue -Object $report -Name "rebuild_restored" -Default $false)
+            $rebuildProcessedByVerifier = [bool](Get-PropertyValue -Object $report -Name "rebuild_processed_by_verifier" -Default $false)
             return [ordered]@{
                 scenario_id = $ScenarioID
                 title = $Title
-                status = if ($duplicateSafe -and $rebuildRestored) { "verified" } else { "degraded" }
+                status = if ($duplicateSafe -and $rebuildRestored -and $rebuildProcessedByVerifier) { "verified" } else { "degraded" }
                 artifact = $artifact
                 started_at_utc = $startedAt
                 completed_at_utc = $completedAt
-                result = "Duplicate-safe: $duplicateSafe; rebuild restored: $rebuildRestored."
+                result = "Duplicate-safe: $duplicateSafe; rebuild restored: $rebuildRestored; verifier observed rebuild: $rebuildProcessedByVerifier."
                 operator_note = "Replay republishes archive records through the same Kafka and processor path."
                 remaining_gap = "Repeat replay drills against the tenant/hour indexed archive layout under larger data volumes."
                 metrics = @(
@@ -359,6 +360,7 @@ function New-DrillEvidence {
                     New-Metric "duplicate delta" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "verifier_duplicate_delta_after_replay") 0)
                     New-Metric "overcount delta" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "source_metric_overcount_delta") 0)
                     New-Metric "rebuild replayed" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "rebuild_replay_response_replayed") 0)
+                    New-Metric "rebuild verifier delta" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "verifier_processed_delta_after_rebuild") 0)
                 )
             }
         }

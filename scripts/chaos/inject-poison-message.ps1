@@ -176,7 +176,7 @@ function Stop-DrillProcessor {
         return
     }
 
-    docker rm -f $ContainerName | Out-Null
+    docker rm -f $ContainerName 2>$null | Out-Null
 }
 
 $headers = Get-AuthHeaders -Token $BearerToken

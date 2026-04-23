@@ -313,17 +313,17 @@ Representative response shape:
     {
       "scenario_id": "broker-outage",
       "title": "Broker outage",
-      "status": "verified",
-      "artifact": "artifacts/failure-drills/broker-outage-20260417-224838.json",
-      "started_at_utc": "2026-04-17T19:49:02Z",
-      "completed_at_utc": "2026-04-17T19:49:52Z",
-      "result": "Archive accounting gap 0; accepted traffic recovered: True.",
-      "operator_note": "Publish failures are explicit, and the processor remains live while Kafka is unavailable.",
-      "remaining_gap": "Client-side timeout counts still require log parsing.",
+      "status": "degraded",
+      "artifact": "artifacts/failure-drills/broker-outage-20260423-182640.json",
+      "started_at_utc": "2026-04-23T15:27:07Z",
+      "completed_at_utc": "2026-04-23T15:28:01Z",
+      "result": "Archive accounting gap 38592; accepted traffic recovered: True.",
+      "operator_note": "Publish failures and backpressure are explicit, and the processor should remain live while Kafka is unavailable.",
+      "remaining_gap": "Batch-path archive accounting is still inconsistent under broker disruption.",
       "metrics": [
         {
           "label": "publish failed",
-          "value": "4,008"
+          "value": "1,608"
         }
       ]
     }

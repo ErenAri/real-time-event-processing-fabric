@@ -77,7 +77,7 @@ Kafka Streams standard:
 | Backpressure model | In-flight limits, Kafka publish latency, and rejection metrics exist | Production stream systems expose explicit queue, mailbox, watermark, and sink backpressure | Backpressure is observable but not yet modeled end-to-end in docs or dashboard | P1 |
 | Archive durability | Compose uses async archive queue for throughput | Cold storage writes should have explicit durability guarantees and retry behavior | Async archive durability is decoupled from HTTP response; queue overflow policy must be tested under sustained overload | P1 |
 | Replay efficiency | New archives use date/tenant/hour layout; legacy fallback exists | Production replay should have selective indexes, progress, cancellation, and rate limits | Replay still scans files within selected hour prefixes and lacks resumable job state | P1 |
-| Failure drills after new fixes | Existing drills cover restart, broker outage, Postgres pause, replay, poison message | Failure evidence should be rerun after major hot-path changes | The 2k batch gate now passes, so post-batch failure drills should be rerun | P1 |
+| Failure drills after new fixes | Existing drills cover restart, broker outage, Postgres pause, replay, poison message | Failure evidence should be rerun after major hot-path changes | The batch/sharded reruns are now complete; restart, Postgres pause, and poison-message passed, but broker outage still shows archive accounting gaps and replay rebuild verification still undercounts rebuilt events | P1 |
 | Chaos coverage | Scripts exist for key scenarios | Production systems test dependency slowness, network partitions, broker ISR loss, disk pressure, and rolling deploys | Current drills do not cover broker disk pressure, partition loss, slow Kafka acks, or rolling deployment | P2 |
 | Observability depth | Prometheus metrics, structured logs, traces hooks, evidence API | Production standard includes trace correlation through ingest, Kafka, processor, DB, and dashboard queries | Trace evidence is not yet captured as a published artifact | P2 |
 | Alerting | Alerts exist in Prometheus config | Operational alerts should be tied to SLOs and runbook actions | Alert thresholds are not yet validated against benchmark and chaos data | P2 |
@@ -104,15 +104,16 @@ Kafka Streams standard:
 
 ## Recommended Next Work
 
-1. Rerun restart, broker-outage, Postgres-pause, replay, and poison-message drills against the batch/sharded hot path.
-2. Add an ingest load balancer service in Compose so `ingest-service` can scale horizontally without host port conflicts.
-3. Add a clean benchmark profile artifact summary that tracks pass rate, min/max, and average across repeated runs.
-4. Profile Kafka publish p99 and dedup claim p99 under the passing 5k profile.
-5. Reduce the tenant aggregate p95 variance still visible in the repeatability set.
-6. Add a capacity model that ties topic partitions, processor replicas, DB write latency, and expected EPS together.
-7. Add retention jobs for `processed_events`, `tenant_metrics`, `source_metrics`, and `event_windows`.
-8. Publish trace evidence for one accepted event through ingest, Kafka, processor, DB write, and dashboard query.
-9. Add cloud benchmark evidence after the local 5k gate is repeatable.
+1. Fix batch-path archive accounting during broker outage so archived, accepted, and `publish_failed` totals reconcile under broker disruption.
+2. Fix the replay rebuild verifier gap so the isolated consumer path observes the full rebuilt event count, not just restored hot-view state.
+3. Add an ingest load balancer service in Compose so `ingest-service` can scale horizontally without host port conflicts.
+4. Add a clean benchmark profile artifact summary that tracks pass rate, min/max, and average across repeated runs.
+5. Profile Kafka publish p99 and dedup claim p99 under the passing 5k profile.
+6. Reduce the tenant aggregate p95 variance still visible in the repeatability set.
+7. Add a capacity model that ties topic partitions, processor replicas, DB write latency, and expected EPS together.
+8. Add retention jobs for `processed_events`, `tenant_metrics`, `source_metrics`, and `event_windows`.
+9. Publish trace evidence for one accepted event through ingest, Kafka, processor, DB write, and dashboard query.
+10. Add cloud benchmark evidence after the local 5k gate is repeatable.
 
 ## Assessment
 

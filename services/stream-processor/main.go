@@ -50,6 +50,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	kafkaTopicPartitions, err := platform.EnvInt("KAFKA_TOPIC_PARTITIONS", 12)
+	if err != nil {
+		return err
+	}
+	kafkaTopicReplicationFactor, err := platform.EnvInt("KAFKA_TOPIC_REPLICATION_FACTOR", 1)
+	if err != nil {
+		return err
+	}
 	processorBatchFlushInterval, err := platform.EnvDuration("PROCESSOR_BATCH_FLUSH_INTERVAL", 100*time.Millisecond)
 	if err != nil {
 		return err
@@ -82,6 +90,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	kafkaEnsureTopicsOnStartup, err := platform.EnvBool("KAFKA_ENSURE_TOPICS_ON_STARTUP", kafkaConnectionConfig.AllowAutoTopicCreation)
+	if err != nil {
+		return err
+	}
 
 	storage, err := store.NewWithAdmin(ctx, postgresURL, postgresAdminURL)
 	if err != nil {
@@ -110,6 +122,23 @@ func run() error {
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+
+	if kafkaEnsureTopicsOnStartup {
+		if err := platform.EnsureKafkaTopics(ctx, brokers, []platform.KafkaTopicSpec{
+			{
+				Name:              topic,
+				NumPartitions:     kafkaTopicPartitions,
+				ReplicationFactor: kafkaTopicReplicationFactor,
+			},
+			{
+				Name:              dlqTopic,
+				NumPartitions:     kafkaTopicPartitions,
+				ReplicationFactor: kafkaTopicReplicationFactor,
+			},
+		}, kafkaConnectionConfig); err != nil {
+			return fmt.Errorf("ensure kafka topics: %w", err)
+		}
+	}
 
 	runner := processor.NewRunner(reader, storage, dlqPublisher, logger, registry, processor.RunnerConfig{
 		PartitionQueueCapacity: partitionQueueCapacity,
@@ -173,6 +202,9 @@ func run() error {
 		"instance_id", instanceID,
 		"partition_queue_capacity", partitionQueueCapacity,
 		"batch_size", processorBatchSize,
+		"kafka_topic_partitions", kafkaTopicPartitions,
+		"kafka_topic_replication_factor", kafkaTopicReplicationFactor,
+		"kafka_ensure_topics_on_startup", kafkaEnsureTopicsOnStartup,
 		"batch_flush_interval", processorBatchFlushInterval.String(),
 		"allowed_lateness", processorAllowedLateness.String(),
 		"retry_backoff", retryBackoff.String(),

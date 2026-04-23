@@ -1,22 +1,22 @@
 ﻿{
     "schema_version":  1,
-    "generated_at":  "2026-04-23T14:54:50.2274618Z",
+    "generated_at":  "2026-04-23T15:44:08.7696918Z",
     "status":  "available",
     "artifact_root":  "artifacts",
     "benchmark":  {
-                      "artifact":  "artifacts/benchmarks/benchmark-20260423-175006.json",
-                      "started_at_utc":  "2026-04-23T14:50:41.4360000Z",
-                      "completed_at_utc":  "2026-04-23T14:51:41.8400000Z",
+                      "artifact":  "artifacts/benchmarks/benchmark-performance-gate-20260423-180442.json",
+                      "started_at_utc":  "2026-04-23T15:05:47.5810000Z",
+                      "completed_at_utc":  "2026-04-23T15:06:47.9600000Z",
                       "target_eps":  5000,
-                      "accepted_eps":  4971.03,
-                      "processed_eps":  5101.71,
-                      "query_p95_ms":  54.91,
-                      "peak_lag":  0,
-                      "post_load_drain_seconds":  2.05,
+                      "accepted_eps":  4958.6,
+                      "processed_eps":  5220.01,
+                      "query_p95_ms":  144,
+                      "peak_lag":  5382,
+                      "post_load_drain_seconds":  0.01,
                       "producer_count":  4,
                       "processor_replicas":  3,
                       "batch_size":  25,
-                      "summary":  "Accepted 4,971.0 eps and processed 5,101.7 eps against a 5,000 eps target using 4 producer(s), 3 processor replica(s), and batch size 25.",
+                      "summary":  "Accepted 4,958.6 eps and processed 5,220.0 eps against a 5,000 eps target using 4 producer(s), 3 processor replica(s), and batch size 25.",
                       "gaps":  [
                                    "No benchmark gate failed in the latest artifact; repeat on clean state before making a broader capacity claim."
                                ],
@@ -25,28 +25,28 @@
                                         "name":  "processed_eps_2000",
                                         "status":  "pass",
                                         "target":  2000,
-                                        "observed":  5101.71,
+                                        "observed":  5220.01,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "processed_eps_5000",
                                         "status":  "pass",
                                         "target":  5000,
-                                        "observed":  5101.71,
+                                        "observed":  5220.01,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "query_p95_250ms",
                                         "status":  "pass",
                                         "target":  250,
-                                        "observed":  54.91,
+                                        "observed":  144,
                                         "unit":  "ms"
                                     },
                                     {
                                         "name":  "post_load_drain_30s",
                                         "status":  "pass",
                                         "target":  30,
-                                        "observed":  2.05,
+                                        "observed":  0.01,
                                         "unit":  "s"
                                     }
                                 ]
@@ -56,20 +56,20 @@
                                "scenario_id":  "restart-processor",
                                "title":  "Processor restart",
                                "status":  "verified",
-                               "artifact":  "artifacts/failure-drills/restart-processor-20260417-225121.json",
-                               "started_at_utc":  "2026-04-17T19:51:42.2420000Z",
-                               "completed_at_utc":  "2026-04-17T19:52:26.7120000Z",
-                               "result":  "Lag recovered in 6.29 seconds.",
+                               "artifact":  "artifacts/failure-drills/restart-processor-20260423-182511.json",
+                               "started_at_utc":  "2026-04-23T15:25:37.5170000Z",
+                               "completed_at_utc":  "2026-04-23T15:26:21.6130000Z",
+                               "result":  "Lag recovered in 6.61 seconds.",
                                "operator_note":  "Consumer group recovery is observable through lag, processed delta, and replica count.",
                                "remaining_gap":  "Repeat at higher load and replica counts.",
                                "metrics":  [
                                                {
                                                    "label":  "accepted delta",
-                                                   "value":  "12,000"
+                                                   "value":  "90,000"
                                                },
                                                {
                                                    "label":  "processed delta",
-                                                   "value":  "8,238"
+                                                   "value":  "104,746"
                                                },
                                                {
                                                    "label":  "peak lag",
@@ -84,21 +84,21 @@
                            {
                                "scenario_id":  "broker-outage",
                                "title":  "Broker outage",
-                               "status":  "verified",
-                               "artifact":  "artifacts/failure-drills/broker-outage-20260417-224838.json",
-                               "started_at_utc":  "2026-04-17T19:49:02.7120000Z",
-                               "completed_at_utc":  "2026-04-17T19:49:52.0490000Z",
-                               "result":  "Archive accounting gap 0; accepted traffic recovered: True.",
+                               "status":  "degraded",
+                               "artifact":  "artifacts/failure-drills/broker-outage-20260423-182640.json",
+                               "started_at_utc":  "2026-04-23T15:27:07.8890000Z",
+                               "completed_at_utc":  "2026-04-23T15:28:01.9900000Z",
+                               "result":  "Archive accounting gap 38592; accepted traffic recovered: True.",
                                "operator_note":  "Publish failures and backpressure are explicit, and the processor should remain live while Kafka is unavailable.",
                                "remaining_gap":  "Client-side timeout counts still require log parsing before they are first-class evidence.",
                                "metrics":  [
                                                {
                                                    "label":  "accepted delta",
-                                                   "value":  "14,152"
+                                                   "value":  "69,800"
                                                },
                                                {
                                                    "label":  "publish failed",
-                                                   "value":  "4,008"
+                                                   "value":  "1,608"
                                                },
                                                {
                                                    "label":  "backpressure",
@@ -114,16 +114,16 @@
                                "scenario_id":  "pause-postgres",
                                "title":  "Postgres pause",
                                "status":  "verified",
-                               "artifact":  "artifacts/failure-drills/pause-postgres-20260417-224710.json",
-                               "started_at_utc":  "2026-04-17T19:47:39.7810000Z",
-                               "completed_at_utc":  "2026-04-17T19:48:24.6420000Z",
-                               "result":  "Processor progress recovered in 0.02 seconds after Postgres became ready.",
+                               "artifact":  "artifacts/failure-drills/pause-postgres-20260423-182821.json",
+                               "started_at_utc":  "2026-04-23T15:28:48.0840000Z",
+                               "completed_at_utc":  "2026-04-23T15:29:57.7240000Z",
+                               "result":  "Processor progress recovered in 0.05 seconds after Postgres became ready.",
                                "operator_note":  "The drill captures write-path degradation, read-path failure, and recovery timing.",
                                "remaining_gap":  "Final lag and producer timeouts still define the overload cleanup work.",
                                "metrics":  [
                                                {
                                                    "label":  "processed delta",
-                                                   "value":  "11,195"
+                                                   "value":  "193,538"
                                                },
                                                {
                                                    "label":  "overview failures",
@@ -131,33 +131,33 @@
                                                },
                                                {
                                                    "label":  "peak API latency",
-                                                   "value":  "3,037.88",
+                                                   "value":  "3,036.41",
                                                    "unit":  "ms"
                                                },
                                                {
                                                    "label":  "final lag",
-                                                   "value":  "163"
+                                                   "value":  "0"
                                                }
                                            ]
                            },
                            {
                                "scenario_id":  "replay-archive",
                                "title":  "Replay rebuild",
-                               "status":  "verified",
-                               "artifact":  "artifacts/failure-drills/replay-archive-20260417193652.json",
-                               "started_at_utc":  "2026-04-17T19:36:52.5423760Z",
-                               "completed_at_utc":  "2026-04-17T19:39:36.2735920Z",
-                               "result":  "Duplicate-safe: True; rebuild restored: True.",
+                               "status":  "degraded",
+                               "artifact":  "artifacts/failure-drills/replay-archive-20260423153016.json",
+                               "started_at_utc":  "2026-04-23T15:30:16.4789000Z",
+                               "completed_at_utc":  "2026-04-23T15:32:37.9731279Z",
+                               "result":  "Duplicate-safe: True; rebuild restored: True; verifier observed rebuild: False.",
                                "operator_note":  "Replay republishes archive records through the same Kafka and processor path.",
                                "remaining_gap":  "Repeat replay drills against the tenant/hour indexed archive layout under larger data volumes.",
                                "metrics":  [
                                                {
                                                    "label":  "replayed duplicates",
-                                                   "value":  "25"
+                                                   "value":  "50"
                                                },
                                                {
                                                    "label":  "duplicate delta",
-                                                   "value":  "25"
+                                                   "value":  "50"
                                                },
                                                {
                                                    "label":  "overcount delta",
@@ -165,7 +165,11 @@
                                                },
                                                {
                                                    "label":  "rebuild replayed",
-                                                   "value":  "25"
+                                                   "value":  "50"
+                                               },
+                                               {
+                                                   "label":  "rebuild verifier delta",
+                                                   "value":  "47"
                                                }
                                            ]
                            },
@@ -173,9 +177,9 @@
                                "scenario_id":  "poison-message",
                                "title":  "Poison message",
                                "status":  "verified",
-                               "artifact":  "artifacts/failure-drills/inject-poison-message-20260417-193308.json",
-                               "started_at_utc":  "2026-04-17T19:32:48.8758679Z",
-                               "completed_at_utc":  "2026-04-17T19:33:08.5116742Z",
+                               "artifact":  "artifacts/failure-drills/inject-poison-message-20260423-153845.json",
+                               "started_at_utc":  "2026-04-23T15:38:42.5823100Z",
+                               "completed_at_utc":  "2026-04-23T15:38:45.8045964Z",
                                "result":  "Dead-letter delta 1.",
                                "operator_note":  "A poison Kafka record should be isolated into the DLQ without blocking the processor loop.",
                                "remaining_gap":  "Add dashboard-level drill trigger only after the evidence endpoint remains stable.",
@@ -186,11 +190,11 @@
                                                },
                                                {
                                                    "label":  "lag before",
-                                                   "value":  "209"
+                                                   "value":  "0"
                                                },
                                                {
                                                    "label":  "lag after",
-                                                   "value":  "579"
+                                                   "value":  "0"
                                                }
                                            ]
                            }

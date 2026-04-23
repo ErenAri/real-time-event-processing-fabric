@@ -1,5 +1,6 @@
 param(
     [int]$Rate = 800,
+    [int]$BatchSize = 25,
     [int]$WarmupSeconds = 5,
     [int]$DurationSeconds = 60,
     [int]$PauseAfterSeconds = 8,
@@ -28,6 +29,11 @@ if ([string]::IsNullOrWhiteSpace($BearerToken)) {
 }
 if ([string]::IsNullOrWhiteSpace($BearerToken)) {
     $BearerToken = $defaultBearerToken
+}
+
+$composeIngestEndpoint = "http://ingest-service:8080/api/v1/events"
+if ($BatchSize -gt 1 -and $composeIngestEndpoint.TrimEnd("/") -ieq "http://ingest-service:8080/api/v1/events") {
+    $composeIngestEndpoint = "http://ingest-service:8080/api/v1/events/batch"
 }
 
 function Get-AuthHeaders {
@@ -373,9 +379,10 @@ try {
     docker compose -f $ComposeFile run -d `
         --name $producerContainerName `
         --no-deps `
-        -e SIM_INGEST_ENDPOINT=http://ingest-service:8080/api/v1/events `
+        -e SIM_INGEST_ENDPOINT=$composeIngestEndpoint `
         -e SIM_BEARER_TOKEN=$BearerToken `
         -e SIM_RATE_PER_SEC=$Rate `
+        -e SIM_BATCH_SIZE=$BatchSize `
         -e SIM_TENANT_COUNT=5 `
         -e SIM_SOURCES_PER_TENANT=25 `
         -e SIM_MAX_IN_FLIGHT=$MaxInFlight `
@@ -539,6 +546,8 @@ $report = [ordered]@{
     started_at_utc                  = $samples[0].timestamp_utc
     completed_at_utc                = $finalSample.timestamp_utc
     rate_target_eps                 = $Rate
+    batch_size                      = $BatchSize
+    ingest_endpoint                 = $composeIngestEndpoint
     warmup_seconds                  = $WarmupSeconds
     duration_seconds                = $DurationSeconds
     pause_after_seconds             = $PauseAfterSeconds
@@ -584,6 +593,7 @@ Write-Host ""
 Write-Host "Failure drill report written to $OutputPath"
 Write-Host ("Accepted delta          : {0}" -f $report.accepted_total_delta)
 Write-Host ("Processed delta         : {0}" -f $report.processed_total_delta)
+Write-Host ("Batch size              : {0}" -f $report.batch_size)
 Write-Host ("Backpressure delta      : {0}" -f $report.backpressure_total_delta)
 Write-Host ("Overview failures       : {0}" -f $report.overview_failure_count)
 Write-Host ("Peak processor in-flight: {0}" -f $report.peak_processor_inflight)
