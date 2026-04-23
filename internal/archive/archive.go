@@ -44,13 +44,15 @@ type ReplayResult struct {
 type FileArchive struct {
 	rootDir string
 
-	mu          sync.Mutex
-	currentKey  string
-	currentFile *os.File
+	mu      sync.Mutex
+	writers map[string]*os.File
 }
 
 func NewFileArchive(rootDir string) *FileArchive {
-	return &FileArchive{rootDir: filepath.Clean(rootDir)}
+	return &FileArchive{
+		rootDir: filepath.Clean(rootDir),
+		writers: map[string]*os.File{},
+	}
 }
 
 func (a *FileArchive) Archive(ctx context.Context, event events.TelemetryEvent, rawPayload []byte) error {
@@ -83,10 +85,11 @@ func (a *FileArchive) Archive(ctx context.Context, event events.TelemetryEvent, 
 	if writerTimestamp.IsZero() {
 		writerTimestamp = record.ArchivedAt
 	}
-	if err := a.ensureWriterLocked(writerTimestamp, event.TenantID); err != nil {
+	writer, err := a.writerForLocked(writerTimestamp, event.TenantID)
+	if err != nil {
 		return err
 	}
-	if _, err := a.currentFile.Write(append(line, '\n')); err != nil {
+	if _, err := writer.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("append archive record: %w", err)
 	}
 
@@ -186,14 +189,14 @@ func (a *FileArchive) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.currentFile == nil {
-		return nil
+	var closeErr error
+	for path, file := range a.writers {
+		if err := file.Close(); err != nil && closeErr == nil {
+			closeErr = fmt.Errorf("close archive file %s: %w", path, err)
+		}
+		delete(a.writers, path)
 	}
-
-	err := a.currentFile.Close()
-	a.currentFile = nil
-	a.currentKey = ""
-	return err
+	return closeErr
 }
 
 func ParseDate(value string) (time.Time, error) {
@@ -204,31 +207,26 @@ func ParseDate(value string) (time.Time, error) {
 	return normalizeDate(parsed), nil
 }
 
-func (a *FileArchive) ensureWriterLocked(timestamp time.Time, tenantID string) error {
-	path := a.pathForEvent(timestamp, tenantID)
-	key := path
-	if a.currentFile != nil && a.currentKey == key {
-		return nil
+func (a *FileArchive) writerForLocked(timestamp time.Time, tenantID string) (*os.File, error) {
+	if a.writers == nil {
+		a.writers = map[string]*os.File{}
 	}
-
-	if a.currentFile != nil {
-		if err := a.currentFile.Close(); err != nil {
-			return fmt.Errorf("close previous archive file: %w", err)
-		}
+	path := a.pathForEvent(timestamp, tenantID)
+	if writer := a.writers[path]; writer != nil {
+		return writer, nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create archive directory: %w", err)
+		return nil, fmt.Errorf("create archive directory: %w", err)
 	}
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("open archive file %s: %w", path, err)
+		return nil, fmt.Errorf("open archive file %s: %w", path, err)
 	}
 
-	a.currentFile = file
-	a.currentKey = key
-	return nil
+	a.writers[path] = file
+	return file, nil
 }
 
 func (a *FileArchive) pathForEvent(timestamp time.Time, tenantID string) string {

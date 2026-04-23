@@ -27,6 +27,11 @@ func (f *fakePublisher) PublishEvent(_ context.Context, event events.TelemetryEv
 	return nil
 }
 
+func (f *fakePublisher) PublishEvents(_ context.Context, eventList []events.TelemetryEvent) error {
+	f.published = append(f.published, eventList...)
+	return nil
+}
+
 func (f *fakePublisher) Close() error {
 	return nil
 }
@@ -160,6 +165,103 @@ func TestIngestHandlerRejectsMalformedPayload(t *testing.T) {
 	}
 	if len(recorder.records) != 1 {
 		t.Fatalf("expected one rejection, got %d", len(recorder.records))
+	}
+}
+
+func TestIngestHandlerAcceptsBatchEvents(t *testing.T) {
+	publisher := &fakePublisher{}
+	recorder := &fakeRejections{}
+	archiver := &fakeArchiver{}
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, recorder, archiver, nil, nil, "", prometheus.NewRegistry())
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", strings.NewReader(`[
+		{
+			"schema_version":1,
+			"event_id":"evt-1",
+			"tenant_id":"tenant_1",
+			"source_id":"sensor_1",
+			"event_type":"telemetry",
+			"timestamp":"2026-04-10T12:00:00Z",
+			"value":91.2,
+			"status":"ok",
+			"region":"eu-west",
+			"sequence":1
+		},
+		{
+			"schema_version":1,
+			"event_id":"evt-2",
+			"tenant_id":"tenant_1",
+			"source_id":"sensor_2",
+			"event_type":"telemetry",
+			"timestamp":"2026-04-10T12:00:01Z",
+			"value":88.2,
+			"status":"warn",
+			"region":"eu-west",
+			"sequence":2
+		}
+	]`))
+	rec := httptest.NewRecorder()
+
+	handler.handleEventBatch(rec, request)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rec.Code)
+	}
+	if len(publisher.published) != 2 {
+		t.Fatalf("expected two published events, got %d", len(publisher.published))
+	}
+	if len(archiver.events) != 2 {
+		t.Fatalf("expected two archived events, got %d", len(archiver.events))
+	}
+	if len(recorder.records) != 0 {
+		t.Fatalf("expected no rejections, got %d", len(recorder.records))
+	}
+}
+
+func TestIngestHandlerRejectsBatchTenantMismatchForTenantToken(t *testing.T) {
+	verifier, err := auth.NewVerifier("secret-value", "pulsestream-local", "pulsestream-local")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	token, err := auth.SignHS256("secret-value", auth.NewClaims(
+		auth.RoleTenantUser,
+		"tenant_1",
+		"user-1",
+		"pulsestream-local",
+		"pulsestream-local",
+		time.Now().Add(time.Hour),
+	))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	publisher := &fakePublisher{}
+	handler := NewIngestHandler(platform.NewLogger("test"), publisher, nil, nil, nil, verifier, "", prometheus.NewRegistry())
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", strings.NewReader(`[
+		{
+			"schema_version":1,
+			"event_id":"evt-1",
+			"tenant_id":"tenant_2",
+			"source_id":"sensor_1",
+			"event_type":"telemetry",
+			"timestamp":"2026-04-10T12:00:00Z",
+			"value":91.2,
+			"status":"ok",
+			"region":"eu-west",
+			"sequence":1
+		}
+	]`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.handleEventBatch(rec, request)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+	if len(publisher.published) != 0 {
+		t.Fatalf("expected zero published events, got %d", len(publisher.published))
 	}
 }
 

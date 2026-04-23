@@ -24,6 +24,7 @@ type Config struct {
 	BearerToken      string
 	ProducerID       string
 	RatePerSecond    int
+	BatchSize        int
 	TenantCount      int
 	SourcesPerTenant int
 	MaxInFlight      int
@@ -91,7 +92,7 @@ func (g *Generator) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	workerCount := max(1, g.config.MaxInFlight)
-	workCh := make(chan int64, workerCount*4)
+	workCh := make(chan []int64, workerCount*4)
 	var workers sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
@@ -101,13 +102,14 @@ func (g *Generator) Run(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
 					return
-				case index, ok := <-workCh:
+				case indexes, ok := <-workCh:
 					if !ok {
 						return
 					}
-					if err := g.sendOne(ctx, index); err != nil {
-						g.failedCounter.Inc()
-						g.failTotal.Add(1)
+					if err := g.send(ctx, indexes); err != nil {
+						failedCount := int64(len(indexes))
+						g.failedCounter.Add(float64(failedCount))
+						g.failTotal.Add(failedCount)
 						g.logger.Error("simulator_send_failed", "error", err)
 					}
 				}
@@ -142,35 +144,34 @@ func (g *Generator) Run(ctx context.Context) error {
 	}
 }
 
-func (g *Generator) dispatchBatch(ctx context.Context, workCh chan<- int64, size int) error {
-	for i := 0; i < size; i++ {
-		index := g.sequence.Add(1)
+func (g *Generator) dispatchBatch(ctx context.Context, workCh chan<- []int64, size int) error {
+	batchSize := max(1, g.config.BatchSize)
+	for i := 0; i < size; {
+		chunkSize := min(batchSize, size-i)
+		indexes := make([]int64, 0, chunkSize)
+		for j := 0; j < chunkSize; j++ {
+			indexes = append(indexes, g.sequence.Add(1))
+		}
+		i += chunkSize
+
 		select {
 		case <-ctx.Done():
 			return nil
-		case workCh <- index:
+		case workCh <- indexes:
 		}
 	}
 	return nil
 }
 
-func (g *Generator) sendOne(ctx context.Context, index int64) error {
-	event := g.nextEvent(index)
-
-	var payload []byte
-	var err error
-	if g.config.MalformedEvery > 0 && index%g.config.MalformedEvery == 0 {
-		payload = []byte(`{"malformed": true`)
-	} else if g.config.DuplicateEvery > 0 && index%g.config.DuplicateEvery == 0 {
-		g.mu.Lock()
-		payload, err = json.Marshal(g.lastValid)
-		g.mu.Unlock()
-	} else {
-		payload, err = json.Marshal(event)
-		g.mu.Lock()
-		g.lastValid = event
-		g.mu.Unlock()
+func (g *Generator) send(ctx context.Context, indexes []int64) error {
+	if len(indexes) == 1 && max(1, g.config.BatchSize) == 1 {
+		return g.sendOne(ctx, indexes[0])
 	}
+	return g.sendMany(ctx, indexes)
+}
+
+func (g *Generator) sendOne(ctx context.Context, index int64) error {
+	payload, err := g.payloadForIndex(index, true)
 	if err != nil {
 		return fmt.Errorf("marshal simulated event: %w", err)
 	}
@@ -196,6 +197,63 @@ func (g *Generator) sendOne(ctx context.Context, index int64) error {
 		return fmt.Errorf("ingest returned %s", response.Status)
 	}
 	return nil
+}
+
+func (g *Generator) sendMany(ctx context.Context, indexes []int64) error {
+	payloads := make([]json.RawMessage, 0, len(indexes))
+	for _, index := range indexes {
+		payload, err := g.payloadForIndex(index, false)
+		if err != nil {
+			return fmt.Errorf("marshal simulated event: %w", err)
+		}
+		payloads = append(payloads, append(json.RawMessage(nil), payload...))
+	}
+
+	payload, err := json.Marshal(payloads)
+	if err != nil {
+		return fmt.Errorf("marshal simulated event batch: %w", err)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, g.config.Endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if token := strings.TrimSpace(g.config.BearerToken); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	response, err := g.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("post event batch: %w", err)
+	}
+	defer response.Body.Close()
+
+	g.sentCounter.Add(float64(len(indexes)))
+	g.sentTotal.Add(int64(len(indexes)))
+	if response.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("ingest returned %s", response.Status)
+	}
+	return nil
+}
+
+func (g *Generator) payloadForIndex(index int64, syntaxMalformed bool) ([]byte, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.config.MalformedEvery > 0 && index%g.config.MalformedEvery == 0 {
+		if syntaxMalformed {
+			return []byte(`{"malformed": true`), nil
+		}
+		return []byte(`{"malformed": true}`), nil
+	}
+	if g.config.DuplicateEvery > 0 && index%g.config.DuplicateEvery == 0 {
+		return json.Marshal(g.lastValid)
+	}
+
+	event := g.nextEvent(index)
+	g.lastValid = event
+	return json.Marshal(event)
 }
 
 func (g *Generator) nextEvent(sequence int64) events.TelemetryEvent {
@@ -224,6 +282,13 @@ func (g *Generator) nextEvent(sequence int64) events.TelemetryEvent {
 
 func max(a int, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a int, b int) int {
+	if a < b {
 		return a
 	}
 	return b

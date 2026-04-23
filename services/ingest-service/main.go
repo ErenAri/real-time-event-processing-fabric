@@ -52,6 +52,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	rawArchiveAsync, err := platform.EnvBool("RAW_ARCHIVE_ASYNC", false)
+	if err != nil {
+		return err
+	}
+	rawArchiveQueueCapacity, err := platform.EnvInt("RAW_ARCHIVE_QUEUE_CAPACITY", 10000)
+	if err != nil {
+		return err
+	}
+	rawArchiveWorkers, err := platform.EnvInt("RAW_ARCHIVE_WORKERS", 1)
+	if err != nil {
+		return err
+	}
+	rawArchiveEnqueueTimeout, err := platform.EnvDuration("RAW_ARCHIVE_ENQUEUE_TIMEOUT", 10*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	rawArchiveWriteTimeout, err := platform.EnvDuration("RAW_ARCHIVE_WRITE_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return err
+	}
 	adminToken := platform.EnvString("ADMIN_TOKEN", "pulsestream-dev-admin")
 	jwtSecret := platform.EnvString("AUTH_JWT_SECRET", "")
 	jwtIssuer := platform.EnvString("AUTH_JWT_ISSUER", "")
@@ -74,6 +94,18 @@ func run() error {
 		return err
 	}
 	kafkaWriteMaxAttempts, err := platform.EnvInt("KAFKA_WRITE_MAX_ATTEMPTS", 2)
+	if err != nil {
+		return err
+	}
+	kafkaPublishBatcherEnabled, err := platform.EnvBool("KAFKA_PUBLISH_BATCHER_ENABLED", false)
+	if err != nil {
+		return err
+	}
+	kafkaPublishQueueCapacity, err := platform.EnvInt("KAFKA_PUBLISH_QUEUE_CAPACITY", 10000)
+	if err != nil {
+		return err
+	}
+	kafkaPublishFlushInterval, err := platform.EnvDuration("KAFKA_PUBLISH_FLUSH_INTERVAL", kafkaBatchTimeout)
 	if err != nil {
 		return err
 	}
@@ -104,12 +136,18 @@ func run() error {
 		}
 	}
 
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+
 	publisher, err := platform.NewKafkaPublisher(brokers, topic, platform.KafkaPublisherConfig{
-		BatchTimeout: kafkaBatchTimeout,
-		BatchSize:    kafkaBatchSize,
-		ReadTimeout:  kafkaReadTimeout,
-		WriteTimeout: kafkaWriteTimeout,
-		MaxAttempts:  kafkaWriteMaxAttempts,
+		BatchTimeout:  kafkaBatchTimeout,
+		BatchSize:     kafkaBatchSize,
+		ReadTimeout:   kafkaReadTimeout,
+		WriteTimeout:  kafkaWriteTimeout,
+		MaxAttempts:   kafkaWriteMaxAttempts,
+		EnableBatcher: kafkaPublishBatcherEnabled,
+		QueueCapacity: kafkaPublishQueueCapacity,
+		FlushInterval: kafkaPublishFlushInterval,
 	}, kafkaConnectionConfig)
 	if err != nil {
 		return err
@@ -132,10 +170,26 @@ func run() error {
 	}
 	defer archiver.Close()
 
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	var rawArchiver api.RawArchiver = archiver
+	if rawArchiveAsync {
+		asyncArchiver := api.NewAsyncArchiver(logger, archiver, registry, api.AsyncArchiverConfig{
+			QueueCapacity:  rawArchiveQueueCapacity,
+			Workers:        rawArchiveWorkers,
+			EnqueueTimeout: rawArchiveEnqueueTimeout,
+			WriteTimeout:   rawArchiveWriteTimeout,
+		})
+		asyncArchiver.Start()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), rawArchiveWriteTimeout)
+			defer cancel()
+			if err := asyncArchiver.Close(shutdownCtx); err != nil {
+				logger.Error("async_archive_close_failed", "error", err)
+			}
+		}()
+		rawArchiver = asyncArchiver
+	}
 
-	handler := api.NewIngestHandler(logger, publisher, storage, archiver, archiver, verifier, adminToken, registry)
+	handler := api.NewIngestHandler(logger, publisher, storage, rawArchiver, archiver, verifier, adminToken, registry)
 	handler.SetMaxInFlight(maxInFlight)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
@@ -181,8 +235,16 @@ func run() error {
 		"kafka_read_timeout", kafkaReadTimeout.String(),
 		"kafka_write_timeout", kafkaWriteTimeout.String(),
 		"kafka_write_max_attempts", kafkaWriteMaxAttempts,
+		"kafka_publish_batcher_enabled", kafkaPublishBatcherEnabled,
+		"kafka_publish_queue_capacity", kafkaPublishQueueCapacity,
+		"kafka_publish_flush_interval", kafkaPublishFlushInterval.String(),
 		"raw_archive_backend", rawArchiveBackend,
 		"raw_archive_dir", rawArchiveDir,
+		"raw_archive_async", rawArchiveAsync,
+		"raw_archive_queue_capacity", rawArchiveQueueCapacity,
+		"raw_archive_workers", rawArchiveWorkers,
+		"raw_archive_enqueue_timeout", rawArchiveEnqueueTimeout.String(),
+		"raw_archive_write_timeout", rawArchiveWriteTimeout.String(),
 		"max_inflight", maxInFlight,
 		"instance_id", instanceID,
 	)

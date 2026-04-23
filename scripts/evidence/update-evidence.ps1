@@ -199,6 +199,7 @@ function New-BenchmarkEvidence {
     }
     $replicas = [int](Get-NumberValue -Object $report -Name "processor_replicas_observed")
     $producerCount = [int](Get-NumberValue -Object $report -Name "producer_count" -Default 1)
+    $batchSize = [int](Get-NumberValue -Object $report -Name "batch_size" -Default 1)
     $queryP95 = Get-NumberValue -Object $report -Name "query_latency_p95_ms"
     $gaps = @()
     $gates = @(
@@ -213,6 +214,9 @@ function New-BenchmarkEvidence {
     }
     if ($processed -lt 2000) {
         $gaps += "Processed throughput is below the next credibility gate of 2,000 eps."
+    }
+    elseif ($processed -lt 5000) {
+        $gaps += "Processed throughput cleared the 2,000 eps gate but remains below the MVP target of 5,000 eps."
     }
     if ($peakLag -gt 50000) {
         $gaps += "Peak consumer lag exceeded 50,000 messages; drain capacity needs more work before claiming strong sustained throughput."
@@ -236,7 +240,8 @@ function New-BenchmarkEvidence {
         post_load_drain_seconds = $drainSeconds
         producer_count = $producerCount
         processor_replicas = $replicas
-        summary = "Accepted $(Format-EvidenceNumber $accepted 1) eps and processed $(Format-EvidenceNumber $processed 1) eps against a $(Format-EvidenceNumber $target 0) eps target using $producerCount producer(s) and $replicas processor replica(s)."
+        batch_size = $batchSize
+        summary = "Accepted $(Format-EvidenceNumber $accepted 1) eps and processed $(Format-EvidenceNumber $processed 1) eps against a $(Format-EvidenceNumber $target 0) eps target using $producerCount producer(s), $replicas processor replica(s), and batch size $batchSize."
         gaps = $gaps
         gates = $gates
     }
@@ -348,7 +353,7 @@ function New-DrillEvidence {
                 completed_at_utc = $completedAt
                 result = "Duplicate-safe: $duplicateSafe; rebuild restored: $rebuildRestored."
                 operator_note = "Replay republishes archive records through the same Kafka and processor path."
-                remaining_gap = "The flat archive is date-partitioned only, so selective tenant replay still scans too many records."
+                remaining_gap = "Repeat replay drills against the tenant/hour indexed archive layout under larger data volumes."
                 metrics = @(
                     New-Metric "replayed duplicates" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "replay_response_replayed") 0)
                     New-Metric "duplicate delta" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "verifier_duplicate_delta_after_replay") 0)

@@ -352,34 +352,8 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 		}
 		return tenantKeys[i].BucketStart.Before(tenantKeys[j].BucketStart)
 	})
-	for _, key := range tenantKeys {
-		aggregate := tenantAggregates[key]
-		_, err = tx.Exec(
-			ctx,
-			`INSERT INTO tenant_metrics (
-			     bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
-			 )
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			 ON CONFLICT (bucket_start, tenant_id)
-			 DO UPDATE SET
-			     events_count = tenant_metrics.events_count + EXCLUDED.events_count,
-			     ok_count = tenant_metrics.ok_count + EXCLUDED.ok_count,
-			     warn_count = tenant_metrics.warn_count + EXCLUDED.warn_count,
-			     error_count = tenant_metrics.error_count + EXCLUDED.error_count,
-			     value_sum = tenant_metrics.value_sum + EXCLUDED.value_sum,
-			     last_event_at = GREATEST(tenant_metrics.last_event_at, EXCLUDED.last_event_at)`,
-			key.BucketStart,
-			key.TenantID,
-			aggregate.EventsCount,
-			aggregate.OKCount,
-			aggregate.WarnCount,
-			aggregate.ErrorCount,
-			aggregate.ValueSum,
-			aggregate.LastEventAt,
-		)
-		if err != nil {
-			return ProcessedEventBatchResult{}, fmt.Errorf("upsert tenant metrics: %w", err)
-		}
+	if err := upsertTenantMetricsBatch(ctx, tx, tenantKeys, tenantAggregates); err != nil {
+		return ProcessedEventBatchResult{}, err
 	}
 	result.StageDurations.TenantAggregateMS = durationMS(time.Since(stageStart))
 
@@ -394,24 +368,8 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 		}
 		return sourceKeys[i].TenantID < sourceKeys[j].TenantID
 	})
-	for _, key := range sourceKeys {
-		aggregate := sourceAggregates[key]
-		_, err = tx.Exec(
-			ctx,
-			`INSERT INTO source_metrics (tenant_id, source_id, events_count, last_event_at)
-			 VALUES ($1, $2, $3, $4)
-			 ON CONFLICT (tenant_id, source_id)
-			 DO UPDATE SET
-			     events_count = source_metrics.events_count + EXCLUDED.events_count,
-			     last_event_at = GREATEST(source_metrics.last_event_at, EXCLUDED.last_event_at)`,
-			key.TenantID,
-			key.SourceID,
-			aggregate.EventsCount,
-			aggregate.LastEventAt,
-		)
-		if err != nil {
-			return ProcessedEventBatchResult{}, fmt.Errorf("upsert source metrics: %w", err)
-		}
+	if err := upsertSourceMetricsBatch(ctx, tx, sourceKeys, sourceAggregates); err != nil {
+		return ProcessedEventBatchResult{}, err
 	}
 	result.StageDurations.SourceAggregateMS = durationMS(time.Since(stageStart))
 
@@ -432,37 +390,8 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 		}
 		return windowKeys[i].SourceID < windowKeys[j].SourceID
 	})
-	for _, key := range windowKeys {
-		aggregate := windowAggregates[key]
-		_, err = tx.Exec(
-			ctx,
-			`INSERT INTO event_windows (
-			     window_size_seconds, window_start, tenant_id, source_id,
-			     events_count, ok_count, warn_count, error_count, value_sum, max_event_at
-			 )
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			 ON CONFLICT (window_size_seconds, window_start, tenant_id, source_id)
-			 DO UPDATE SET
-			     events_count = event_windows.events_count + EXCLUDED.events_count,
-			     ok_count = event_windows.ok_count + EXCLUDED.ok_count,
-			     warn_count = event_windows.warn_count + EXCLUDED.warn_count,
-			     error_count = event_windows.error_count + EXCLUDED.error_count,
-			     value_sum = event_windows.value_sum + EXCLUDED.value_sum,
-			     max_event_at = GREATEST(event_windows.max_event_at, EXCLUDED.max_event_at)`,
-			key.WindowSizeSeconds,
-			key.WindowStart,
-			key.TenantID,
-			key.SourceID,
-			aggregate.EventsCount,
-			aggregate.OKCount,
-			aggregate.WarnCount,
-			aggregate.ErrorCount,
-			aggregate.ValueSum,
-			aggregate.LastEventAt,
-		)
-		if err != nil {
-			return ProcessedEventBatchResult{}, fmt.Errorf("upsert event windows: %w", err)
-		}
+	if err := upsertEventWindowsBatch(ctx, tx, windowKeys, windowAggregates); err != nil {
+		return ProcessedEventBatchResult{}, err
 	}
 	result.StageDurations.WindowAggregateMS = durationMS(time.Since(stageStart))
 
@@ -530,6 +459,171 @@ func addAggregate[K comparable](target map[K]metricAggregate, key K, value metri
 		current.LastEventAt = value.LastEventAt
 	}
 	target[key] = current
+}
+
+func upsertTenantMetricsBatch(ctx context.Context, tx pgx.Tx, keys []tenantMetricKey, aggregates map[tenantMetricKey]metricAggregate) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	bucketStarts := make([]time.Time, 0, len(keys))
+	tenantIDs := make([]string, 0, len(keys))
+	eventsCounts := make([]int64, 0, len(keys))
+	okCounts := make([]int64, 0, len(keys))
+	warnCounts := make([]int64, 0, len(keys))
+	errorCounts := make([]int64, 0, len(keys))
+	valueSums := make([]float64, 0, len(keys))
+	lastEventAts := make([]time.Time, 0, len(keys))
+	for _, key := range keys {
+		aggregate := aggregates[key]
+		bucketStarts = append(bucketStarts, key.BucketStart)
+		tenantIDs = append(tenantIDs, key.TenantID)
+		eventsCounts = append(eventsCounts, aggregate.EventsCount)
+		okCounts = append(okCounts, aggregate.OKCount)
+		warnCounts = append(warnCounts, aggregate.WarnCount)
+		errorCounts = append(errorCounts, aggregate.ErrorCount)
+		valueSums = append(valueSums, aggregate.ValueSum)
+		lastEventAts = append(lastEventAts, aggregate.LastEventAt)
+	}
+
+	if _, err := tx.Exec(
+		ctx,
+		`INSERT INTO tenant_metrics (
+		     bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
+		 )
+		 SELECT bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
+		 FROM unnest(
+		     $1::timestamptz[], $2::text[], $3::bigint[], $4::bigint[],
+		     $5::bigint[], $6::bigint[], $7::double precision[], $8::timestamptz[]
+		 ) AS rows(bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at)
+		 ON CONFLICT (bucket_start, tenant_id)
+		 DO UPDATE SET
+		     events_count = tenant_metrics.events_count + EXCLUDED.events_count,
+		     ok_count = tenant_metrics.ok_count + EXCLUDED.ok_count,
+		     warn_count = tenant_metrics.warn_count + EXCLUDED.warn_count,
+		     error_count = tenant_metrics.error_count + EXCLUDED.error_count,
+		     value_sum = tenant_metrics.value_sum + EXCLUDED.value_sum,
+		     last_event_at = GREATEST(tenant_metrics.last_event_at, EXCLUDED.last_event_at)`,
+		bucketStarts,
+		tenantIDs,
+		eventsCounts,
+		okCounts,
+		warnCounts,
+		errorCounts,
+		valueSums,
+		lastEventAts,
+	); err != nil {
+		return fmt.Errorf("upsert tenant metrics: %w", err)
+	}
+	return nil
+}
+
+func upsertSourceMetricsBatch(ctx context.Context, tx pgx.Tx, keys []sourceMetricKey, aggregates map[sourceMetricKey]metricAggregate) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	tenantIDs := make([]string, 0, len(keys))
+	sourceIDs := make([]string, 0, len(keys))
+	eventsCounts := make([]int64, 0, len(keys))
+	lastEventAts := make([]time.Time, 0, len(keys))
+	for _, key := range keys {
+		aggregate := aggregates[key]
+		tenantIDs = append(tenantIDs, key.TenantID)
+		sourceIDs = append(sourceIDs, key.SourceID)
+		eventsCounts = append(eventsCounts, aggregate.EventsCount)
+		lastEventAts = append(lastEventAts, aggregate.LastEventAt)
+	}
+
+	if _, err := tx.Exec(
+		ctx,
+		`INSERT INTO source_metrics (tenant_id, source_id, events_count, last_event_at)
+		 SELECT tenant_id, source_id, events_count, last_event_at
+		 FROM unnest(
+		     $1::text[], $2::text[], $3::bigint[], $4::timestamptz[]
+		 ) AS rows(tenant_id, source_id, events_count, last_event_at)
+		 ON CONFLICT (tenant_id, source_id)
+		 DO UPDATE SET
+		     events_count = source_metrics.events_count + EXCLUDED.events_count,
+		     last_event_at = GREATEST(source_metrics.last_event_at, EXCLUDED.last_event_at)`,
+		tenantIDs,
+		sourceIDs,
+		eventsCounts,
+		lastEventAts,
+	); err != nil {
+		return fmt.Errorf("upsert source metrics: %w", err)
+	}
+	return nil
+}
+
+func upsertEventWindowsBatch(ctx context.Context, tx pgx.Tx, keys []windowMetricKey, aggregates map[windowMetricKey]metricAggregate) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	windowSizeSeconds := make([]int32, 0, len(keys))
+	windowStarts := make([]time.Time, 0, len(keys))
+	tenantIDs := make([]string, 0, len(keys))
+	sourceIDs := make([]string, 0, len(keys))
+	eventsCounts := make([]int64, 0, len(keys))
+	okCounts := make([]int64, 0, len(keys))
+	warnCounts := make([]int64, 0, len(keys))
+	errorCounts := make([]int64, 0, len(keys))
+	valueSums := make([]float64, 0, len(keys))
+	maxEventAts := make([]time.Time, 0, len(keys))
+	for _, key := range keys {
+		aggregate := aggregates[key]
+		windowSizeSeconds = append(windowSizeSeconds, int32(key.WindowSizeSeconds))
+		windowStarts = append(windowStarts, key.WindowStart)
+		tenantIDs = append(tenantIDs, key.TenantID)
+		sourceIDs = append(sourceIDs, key.SourceID)
+		eventsCounts = append(eventsCounts, aggregate.EventsCount)
+		okCounts = append(okCounts, aggregate.OKCount)
+		warnCounts = append(warnCounts, aggregate.WarnCount)
+		errorCounts = append(errorCounts, aggregate.ErrorCount)
+		valueSums = append(valueSums, aggregate.ValueSum)
+		maxEventAts = append(maxEventAts, aggregate.LastEventAt)
+	}
+
+	if _, err := tx.Exec(
+		ctx,
+		`INSERT INTO event_windows (
+		     window_size_seconds, window_start, tenant_id, source_id,
+		     events_count, ok_count, warn_count, error_count, value_sum, max_event_at
+		 )
+		 SELECT
+		     window_size_seconds, window_start, tenant_id, source_id,
+		     events_count, ok_count, warn_count, error_count, value_sum, max_event_at
+		 FROM unnest(
+		     $1::integer[], $2::timestamptz[], $3::text[], $4::text[],
+		     $5::bigint[], $6::bigint[], $7::bigint[], $8::bigint[],
+		     $9::double precision[], $10::timestamptz[]
+		 ) AS rows(
+		     window_size_seconds, window_start, tenant_id, source_id,
+		     events_count, ok_count, warn_count, error_count, value_sum, max_event_at
+		 )
+		 ON CONFLICT (window_size_seconds, window_start, tenant_id, source_id)
+		 DO UPDATE SET
+		     events_count = event_windows.events_count + EXCLUDED.events_count,
+		     ok_count = event_windows.ok_count + EXCLUDED.ok_count,
+		     warn_count = event_windows.warn_count + EXCLUDED.warn_count,
+		     error_count = event_windows.error_count + EXCLUDED.error_count,
+		     value_sum = event_windows.value_sum + EXCLUDED.value_sum,
+		     max_event_at = GREATEST(event_windows.max_event_at, EXCLUDED.max_event_at)`,
+		windowSizeSeconds,
+		windowStarts,
+		tenantIDs,
+		sourceIDs,
+		eventsCounts,
+		okCounts,
+		warnCounts,
+		errorCounts,
+		valueSums,
+		maxEventAts,
+	); err != nil {
+		return fmt.Errorf("upsert event windows: %w", err)
+	}
+	return nil
 }
 
 func durationMS(value time.Duration) float64 {

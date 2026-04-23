@@ -116,7 +116,8 @@ Replayed records go through Kafka and the normal processor path, so duplicate re
 ## Known Gaps
 
 - The local `5,000 eps` target is not met yet; the next credibility gate is `2,000 processed eps`.
-- Stage-level histograms exist, but benchmark evidence must be regenerated after the batching change.
+- The best post-fix local `2,000 eps` gate processed `1,166.05 eps`; the latest local gate processed `910.44 eps`.
 - Late-event handling is deterministic per processor partition, but it is not a full event-time watermark system.
 - PostgreSQL remains the hot path; Redis or framework-managed state is intentionally deferred.
+- The optional Kafka publish batcher is disabled in the Compose benchmark profile because the current local evidence did not show an improvement.
 - Flink or Kafka Streams integration is deferred until the custom Go pipeline has credible local throughput evidence.

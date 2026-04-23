@@ -1,53 +1,52 @@
 ﻿{
     "schema_version":  1,
-    "generated_at":  "2026-04-20T13:13:35.4478712Z",
+    "generated_at":  "2026-04-23T10:28:05.4644939Z",
     "status":  "available",
     "artifact_root":  "artifacts",
     "benchmark":  {
-                      "artifact":  "artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json",
-                      "started_at_utc":  "2026-04-20T13:08:00.3120000Z",
-                      "completed_at_utc":  "2026-04-20T13:09:01.0840000Z",
-                      "target_eps":  2000,
-                      "accepted_eps":  717.1,
-                      "processed_eps":  495.08,
-                      "query_p95_ms":  265.82,
-                      "peak_lag":  5114,
-                      "post_load_drain_seconds":  39.53,
+                      "artifact":  "artifacts/benchmarks/benchmark-20260423-132558.json",
+                      "started_at_utc":  "2026-04-23T10:26:34.6540000Z",
+                      "completed_at_utc":  "2026-04-23T10:27:34.8930000Z",
+                      "target_eps":  5000,
+                      "accepted_eps":  4980.08,
+                      "processed_eps":  4962.23,
+                      "query_p95_ms":  52.19,
+                      "peak_lag":  163,
+                      "post_load_drain_seconds":  3.59,
                       "producer_count":  4,
                       "processor_replicas":  3,
-                      "summary":  "Accepted 717.1 eps and processed 495.1 eps against a 2,000 eps target using 4 producer(s) and 3 processor replica(s).",
+                      "batch_size":  25,
+                      "summary":  "Accepted 4,980.1 eps and processed 4,962.2 eps against a 5,000 eps target using 4 producer(s), 3 processor replica(s), and batch size 25.",
                       "gaps":  [
-                                   "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck.",
-                                   "Processed throughput is below the next credibility gate of 2,000 eps.",
-                                   "Post-load drain exceeded 30 seconds; processor capacity does not yet clear backlog quickly."
+                                   "Processed throughput cleared the 2,000 eps gate but remains below the MVP target of 5,000 eps."
                                ],
                       "gates":  [
                                     {
                                         "name":  "processed_eps_2000",
-                                        "status":  "fail",
+                                        "status":  "pass",
                                         "target":  2000,
-                                        "observed":  495.08,
+                                        "observed":  4962.23,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "processed_eps_5000",
                                         "status":  "fail",
                                         "target":  5000,
-                                        "observed":  495.08,
+                                        "observed":  4962.23,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "query_p95_250ms",
-                                        "status":  "fail",
+                                        "status":  "pass",
                                         "target":  250,
-                                        "observed":  265.82,
+                                        "observed":  52.19,
                                         "unit":  "ms"
                                     },
                                     {
                                         "name":  "post_load_drain_30s",
-                                        "status":  "fail",
+                                        "status":  "pass",
                                         "target":  30,
-                                        "observed":  39.53,
+                                        "observed":  3.59,
                                         "unit":  "s"
                                     }
                                 ]
@@ -150,7 +149,7 @@
                                "completed_at_utc":  "2026-04-17T19:39:36.2735920Z",
                                "result":  "Duplicate-safe: True; rebuild restored: True.",
                                "operator_note":  "Replay republishes archive records through the same Kafka and processor path.",
-                               "remaining_gap":  "The flat archive is date-partitioned only, so selective tenant replay still scans too many records.",
+                               "remaining_gap":  "Repeat replay drills against the tenant/hour indexed archive layout under larger data volumes.",
                                "metrics":  [
                                                {
                                                    "label":  "replayed duplicates",
