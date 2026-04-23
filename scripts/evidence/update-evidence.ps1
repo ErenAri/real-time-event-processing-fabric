@@ -225,7 +225,7 @@ function New-BenchmarkEvidence {
         $gaps += "Post-load drain exceeded 30 seconds; processor capacity does not yet clear backlog quickly."
     }
     if ($gaps.Count -eq 0) {
-        $gaps += "No blocking benchmark gap detected by the summary generator; inspect raw artifact before publishing claims."
+        $gaps += "No benchmark gate failed in the latest artifact; repeat on clean state before making a broader capacity claim."
     }
 
     return [ordered]@{

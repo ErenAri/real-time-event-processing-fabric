@@ -1,6 +1,8 @@
 package store
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -108,5 +110,37 @@ func TestAggregateProcessorStates(t *testing.T) {
 	}
 	if aggregate.ProcessingP99MS != 30.3 {
 		t.Fatalf("p99 mismatch: got %.1f want %.1f", aggregate.ProcessingP99MS, 30.3)
+	}
+}
+
+func TestTenantMetricShardIDIsStableBoundedAndDistributed(t *testing.T) {
+	first := tenantMetricShardID("tenant_01", "sensor_001")
+	second := tenantMetricShardID("tenant_01", "sensor_001")
+	if first != second {
+		t.Fatalf("shard id must be stable: got %d and %d", first, second)
+	}
+	if first < 0 || first >= tenantMetricShardCount {
+		t.Fatalf("shard id out of range: got %d", first)
+	}
+
+	seen := map[int32]bool{}
+	for i := 0; i < 200; i++ {
+		seen[tenantMetricShardID("tenant_01", fmt.Sprintf("sensor_%03d", i))] = true
+	}
+	if len(seen) < tenantMetricShardCount/2 {
+		t.Fatalf("expected source ids to spread across shards, got %d distinct shards", len(seen))
+	}
+}
+
+func TestSchemaSQLIncludesTenantMetricShards(t *testing.T) {
+	sql := (&Store{runtimeRole: "pulsestream_app"}).schemaSQL()
+	if !strings.Contains(sql, "CREATE TABLE IF NOT EXISTS tenant_metric_shards") {
+		t.Fatal("schema SQL must create tenant_metric_shards")
+	}
+	if !strings.Contains(sql, "CREATE POLICY tenant_metric_shards_access") {
+		t.Fatal("schema SQL must protect tenant_metric_shards with RLS")
+	}
+	if strings.Contains(sql, "%!") {
+		t.Fatalf("schema SQL has unresolved format placeholder: %s", sql)
 	}
 }

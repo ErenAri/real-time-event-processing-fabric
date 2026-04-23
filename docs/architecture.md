@@ -171,7 +171,8 @@ Each processor replica writes an instance-scoped heartbeat and metric snapshot i
 
 ## Data owned by PostgreSQL
 
-- `tenant_metrics`: 10-second aggregate buckets for tenant charts
+- `tenant_metrics`: legacy 10-second tenant aggregate buckets kept in rollup reads for compatibility
+- `tenant_metric_shards`: current 10-second tenant aggregate shards used to reduce hot-row contention under high load
 - `source_metrics`: cumulative source counts for top-N queries
 - `event_windows`: fixed 1-minute and 5-minute event-time windows by tenant and source
 - `processed_events`: deduplication keys

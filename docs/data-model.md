@@ -52,6 +52,18 @@ erDiagram
         timestamptz last_event_at
     }
 
+    tenant_metric_shards {
+        timestamptz bucket_start PK
+        text tenant_id PK
+        int shard_id PK
+        bigint events_count
+        bigint ok_count
+        bigint warn_count
+        bigint error_count
+        double value_sum
+        timestamptz last_event_at
+    }
+
     source_metrics {
         text tenant_id PK
         text source_id PK
@@ -88,7 +100,7 @@ erDiagram
         timestamptz updated_at
     }
 
-    processed_events ||--o{ tenant_metrics : contributes_to
+    processed_events ||--o{ tenant_metric_shards : contributes_to
     processed_events ||--o{ source_metrics : contributes_to
     processed_events ||--o{ event_windows : contributes_to
 ```
@@ -98,11 +110,22 @@ erDiagram
 | Table | Purpose |
 | --- | --- |
 | `processed_events` | Deduplication guard keyed by `event_id`; duplicate inserts skip aggregate updates |
-| `tenant_metrics` | 10-second aggregate buckets used for throughput and status charts |
+| `tenant_metrics` | Legacy 10-second aggregate buckets still included in tenant rollup reads |
+| `tenant_metric_shards` | Current 10-second tenant aggregate buckets keyed by deterministic shard to reduce hot-row contention |
 | `source_metrics` | Per-tenant cumulative source counters used for top-source queries |
 | `event_windows` | Fixed 1-minute and 5-minute event-time windows keyed by tenant, source, window size, and deterministic window start |
 | `rejection_events` | Records ingest validation failures and publish failures |
 | `service_state` | Stores per-instance heartbeats and counters for ingest, processor, and query services |
+
+## Tenant aggregate sharding
+
+The processor writes current tenant throughput/status aggregates to `tenant_metric_shards` instead of directly updating one hot `(bucket_start, tenant_id)` row. The shard is deterministic from tenant and source identity:
+
+```text
+shard_id = fnv32a(tenant_id + "\0" + source_id) % 32
+```
+
+Query APIs read tenant throughput through a rollup that combines legacy `tenant_metrics` rows and current `tenant_metric_shards` rows. This preserves existing local data while reducing write contention during high-rate benchmarks.
 
 ## Event-time semantics
 

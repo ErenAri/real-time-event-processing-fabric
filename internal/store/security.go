@@ -108,6 +108,20 @@ CREATE TABLE IF NOT EXISTS tenant_metrics (
     PRIMARY KEY (bucket_start, tenant_id)
 );
 
+CREATE TABLE IF NOT EXISTS tenant_metric_shards (
+    bucket_start TIMESTAMPTZ NOT NULL,
+    tenant_id TEXT NOT NULL,
+    shard_id INTEGER NOT NULL,
+    events_count BIGINT NOT NULL DEFAULT 0,
+    ok_count BIGINT NOT NULL DEFAULT 0,
+    warn_count BIGINT NOT NULL DEFAULT 0,
+    error_count BIGINT NOT NULL DEFAULT 0,
+    value_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_event_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (bucket_start, tenant_id, shard_id),
+    CHECK (shard_id >= 0)
+);
+
 CREATE TABLE IF NOT EXISTS source_metrics (
     tenant_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
@@ -165,6 +179,9 @@ ALTER TABLE service_state
 CREATE INDEX IF NOT EXISTS idx_tenant_metrics_tenant_bucket
     ON tenant_metrics (tenant_id, bucket_start DESC);
 
+CREATE INDEX IF NOT EXISTS idx_tenant_metric_shards_tenant_bucket
+    ON tenant_metric_shards (tenant_id, bucket_start DESC);
+
 CREATE INDEX IF NOT EXISTS idx_source_metrics_events
     ON source_metrics (events_count DESC);
 
@@ -204,6 +221,20 @@ ALTER TABLE tenant_metrics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_metrics FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_metrics_access ON tenant_metrics;
 CREATE POLICY tenant_metrics_access ON tenant_metrics
+    FOR ALL TO %s
+    USING (
+        current_setting('app.role', true) IN ('service', 'admin')
+        OR tenant_id = current_setting('app.tenant_id', true)
+    )
+    WITH CHECK (
+        current_setting('app.role', true) IN ('service', 'admin')
+        OR tenant_id = current_setting('app.tenant_id', true)
+    );
+
+ALTER TABLE tenant_metric_shards ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_metric_shards FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_metric_shards_access ON tenant_metric_shards;
+CREATE POLICY tenant_metric_shards_access ON tenant_metric_shards
     FOR ALL TO %s
     USING (
         current_setting('app.role', true) IN ('service', 'admin')
@@ -263,6 +294,7 @@ CREATE POLICY service_state_access ON service_state
     FOR ALL TO %s
     USING (current_setting('app.role', true) IN ('service', 'admin'))
     WITH CHECK (current_setting('app.role', true) IN ('service', 'admin'));`,
+		role,
 		role,
 		role,
 		role,
