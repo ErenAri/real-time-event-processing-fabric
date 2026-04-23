@@ -100,7 +100,7 @@ func NewIngestHandler(
 		}),
 		archiveDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "pulsestream_ingest_archive_duration_seconds",
-			Help:    "Duration of raw archive writes for valid events.",
+			Help:    "Duration of the ingest archive step for valid events. In async mode this is enqueue latency.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		acceptedCounter: prometheus.NewCounter(prometheus.CounterOpts{
@@ -109,7 +109,7 @@ func NewIngestHandler(
 		}),
 		archivedCounter: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pulsestream_ingest_archived_total",
-			Help: "Number of valid events written to the raw archive.",
+			Help: "Number of valid events accepted by the ingest archive step.",
 		}),
 		replayCounter: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pulsestream_ingest_replayed_total",

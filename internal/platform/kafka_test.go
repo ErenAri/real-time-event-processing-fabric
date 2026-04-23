@@ -2,7 +2,9 @@ package platform
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,10 +18,14 @@ import (
 )
 
 type fakeKafkaWriter struct {
+	mu       sync.Mutex
 	messages []kafka.Message
 }
 
 func (f *fakeKafkaWriter) WriteMessages(_ context.Context, messages ...kafka.Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.messages = append(f.messages, messages...)
 	return nil
 }
@@ -63,6 +69,56 @@ func TestKafkaPublisherInjectsTraceContextHeaders(t *testing.T) {
 	}
 	if findHeaderValue(writer.messages[0].Headers, "traceparent") == "" {
 		t.Fatal("expected traceparent header to be present on published message")
+	}
+}
+
+func TestKafkaPublisherBatcherWritesMultipleMessages(t *testing.T) {
+	restore := installKafkaTestTelemetry(t)
+	defer restore()
+
+	writer := &fakeKafkaWriter{}
+	publisher := &KafkaPublisher{
+		writer:  writer,
+		topic:   "pulsestream.events",
+		brokers: []string{"kafka:9092"},
+	}
+	publisher.startBatcher(KafkaPublisherConfig{
+		BatchSize:     2,
+		QueueCapacity: 4,
+		FlushInterval: time.Hour,
+		WriteTimeout:  time.Second,
+	})
+	defer publisher.Close()
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			errs <- publisher.PublishEvent(context.Background(), events.TelemetryEvent{
+				SchemaVersion: events.CurrentSchemaVersion,
+				EventID:       fmt.Sprintf("evt-%d", i),
+				TenantID:      "tenant_01",
+				SourceID:      fmt.Sprintf("sensor_%02d", i),
+				EventType:     "telemetry",
+				Timestamp:     time.Now().UTC(),
+				Value:         12.5,
+				Status:        events.StatusOK,
+				Region:        "eu-west",
+				Sequence:      int64(i),
+			})
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("publish event: %v", err)
+		}
+	}
+
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if len(writer.messages) != 2 {
+		t.Fatalf("expected two published messages, got %d", len(writer.messages))
 	}
 }
 

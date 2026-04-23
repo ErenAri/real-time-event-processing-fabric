@@ -117,15 +117,19 @@ The gate wrapper adds:
 | 2026-04-10 | 1500 | 33s | 700.37 | 595.02 | 11 | 19 | 1246 | exact-count harness, `3` processor replicas, artifact `artifacts/benchmarks/benchmark-20260410-213110.json` |
 | 2026-04-17 | 5000 | 63.1s | 955.91 | 329.37 | 243 | 432 | 10969 | `4` producers, `3` processor replicas, `50` tenants, `200` sources per tenant, artifact `artifacts/benchmarks/benchmark-20260417-222710.json`; target not met |
 | 2026-04-20 | 2000 | 60.77s | 717.1 | 495.08 | 336 | 2997 | 5114 | performance gate wrapper, `4` producers, `3` processor replicas, `50` tenants, `200` sources per tenant, artifact `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json`; target not met |
+| 2026-04-23 | 2000 | 60.94s | 1308.55 | 1166.05 | 40 | 67 | 273 | async archive plus set-based aggregate writes, `4` producers, `3` processor replicas, artifact `artifacts/benchmarks/benchmark-performance-gate-20260423-123425.json`; best post-fix run, target not met |
+| 2026-04-23 | 2000 | 61.12s | 1262.27 | 1103.11 | 85 | 214 | 74 | higher ingest in-flight cap experiment, artifact `artifacts/benchmarks/benchmark-performance-gate-20260423-124031.json`; target not met |
+| 2026-04-23 | 2000 | 60.53s | 1091.64 | 1137.95 | 77 | 198 | 1157 | Kafka publish batcher experiment, artifact `artifacts/benchmarks/benchmark-performance-gate-20260423-124638.json`; publish latency regressed, target not met |
+| 2026-04-23 | 2000 | 60.53s | 898.67 | 910.44 | 69 | 182 | 0 | latest evidence run with batcher disabled, artifact `artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json`; target not met |
 
 ## MVP gate status
 
 | Gate | Target | Current result | Status |
 | --- | --- | --- | --- |
-| Intermediate throughput | sustain `2,000 processed eps` locally | latest gate processed `495.08 eps` | Not met |
-| MVP throughput | sustain `5,000 processed eps` locally | latest gate processed `495.08 eps` | Not met |
-| Query latency | dashboard/API p95 below `250 ms` | latest gate query p95 was `265.82 ms` | Not met |
-| Post-load drain | lag returns to pre-run level within `30s` | latest gate drained in `39.53s` | Not met |
+| Intermediate throughput | sustain `2,000 processed eps` locally | latest gate processed `910.44 eps`; best post-fix gate processed `1,166.05 eps` | Not met |
+| MVP throughput | sustain `5,000 processed eps` locally | best post-fix gate processed `1,166.05 eps` | Not met |
+| Query latency | dashboard/API p95 below `250 ms` | latest gate query p95 was `135.03 ms`; best post-fix gate query p95 was `63.97 ms` | Met in latest 2k runs |
+| Post-load drain | lag returns to pre-run level within `30s` | latest gate drained in `2.02s`; best post-fix gate drained in `0.01s` | Met in latest 2k runs |
 | Processor recovery | consumer restart recovers without data loss at sustainable rate | restart drill recovered lag in `6.29s` at `300 eps` with `3` processor replicas | Met at controlled rate |
 | Broker failure accounting | publish failures visible and archive accounting closed | broker outage had archive accounting gap `0` and accepted traffic recovered in `2.09s` | Met |
 | Replay/idempotency | replay does not overcount hot views | `25` duplicate replays produced `0` source-metric overcount; rebuild restored hot views | Met |
@@ -157,19 +161,20 @@ The committed example is `docs/evidence.example.json`. Runtime artifacts remain 
 
 ## Interpretation
 
-- The processor hot path uses bounded per-partition batches, and the latest 2k gate still fails. Do not claim the 2k target is met.
+- The processor hot path uses bounded per-partition batches and set-based aggregate upserts, and the latest 2k gate still fails. Do not claim the 2k target is met.
 - Multi-producer generation prevents a single simulator process from being the only limiter, and `SIM_PRODUCER_ID` prevents synthetic `event_id` collisions across producers.
-- The latest 2k gate accepted only `717.1 eps` from an offered `2,000 eps`, and benchmark producers reported `269.46 failed eps`. Ingest and producer-side pressure remain part of the bottleneck.
-- Query latency is now also close to the gate boundary. The latest 2k gate had overview query p95 of `265.82 ms`, above the `250 ms` threshold.
+- The latest 2k gate accepted only `898.67 eps` from an offered `2,000 eps`. The best post-fix run accepted `1,308.55 eps`. Ingest and producer-side pressure remain part of the bottleneck.
+- Query latency is no longer the immediate blocker in the latest 2k runs. The remaining blocker is throughput.
 - Backpressure rejections are now metric-only instead of being written to PostgreSQL rejection rows, which avoids amplifying database load during overload.
 - Poison-message handling is verified separately in `artifacts/failure-drills/inject-poison-message-20260417-193308.json` so malformed direct-to-Kafka records can be tested without distorting the hot benchmark stream.
 - Processor scale-out exposed a startup DDL deadlock in schema initialization. The fix adds a schema migration marker plus retry around PostgreSQL deadlock and serialization errors so additional processor replicas do not repeatedly run the full DDL block.
+- The optional Kafka publish batcher is implemented behind `KAFKA_PUBLISH_BATCHER_ENABLED`, but the 2026-04-23 local experiment regressed Kafka publish p95. It remains disabled in the Compose benchmark profile.
 
 ## Current bottleneck
 
-The next performance limitation is not solely the processor. The latest 2k gate shows producer/client failures, ingest archive and Kafka publish latency, and PostgreSQL hot-view writes all contributing.
+The next performance limitation is not solely the processor. The latest 2k evidence shows Kafka publish latency, producer/client pressure, and PostgreSQL tenant aggregate spikes all contributing.
 
-Measured slow stages from `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json`:
+Measured slow stages before the 2026-04-23 fixes from `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json`:
 
 - Ingest archive write: `p95 3827.14 ms`
 - Ingest Kafka publish: `p95 2149.53 ms`
@@ -177,13 +182,29 @@ Measured slow stages from `artifacts/benchmarks/benchmark-performance-gate-20260
 - Processor window aggregate upsert: `p95 1869.98 ms`
 - Processor dedup claim: `p95 334.03 ms`
 
+Measured slow stages after the 2026-04-23 fixes from the best post-fix run, `artifacts/benchmarks/benchmark-performance-gate-20260423-123425.json`:
+
+- Ingest archive step: `p95 4.76 ms`
+- Ingest Kafka publish: `p95 705.11 ms`
+- Processor tenant aggregate upsert: `p95 746 ms`
+- Processor window aggregate upsert: `p95 47.78 ms`
+- Processor dedup claim: `p95 40.63 ms`
+
+Measured slow stages from the latest run, `artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json`:
+
+- Ingest archive step: `p95 4.76 ms`
+- Ingest Kafka publish: `p95 1738.8 ms`
+- Processor tenant aggregate upsert: `p95 650.45 ms`
+- Processor window aggregate upsert: `p95 43.93 ms`
+- Processor dedup claim: `p95 30.59 ms`
+
 The benchmark evidence is useful because it shows where the system fails, but it should not be presented as a 2k or 5k eps success.
 
 The next defensible benchmark step is one of:
 
-- move raw archive writes out of the synchronous ingest request path, or batch/async them with explicit durability tradeoffs
-- reduce tenant/window aggregate write amplification in PostgreSQL, likely with larger grouped upserts or a staging-table merge
-- profile Kafka writer flush behavior under the `2,000 eps` offered-load run
+- scale the ingest publish path horizontally or introduce a production-shaped ingest batch endpoint so HTTP one-event-per-request overhead does not dominate
+- profile Kafka writer flush behavior and broker I/O under the `2,000 eps` offered-load run
+- reduce tenant aggregate write amplification further, likely with partitioned hot tables, staging-table merge, or lower-cardinality rollups
 - profile processor PostgreSQL write latency and batch behavior under sustained backlog
 - rerun the `2,000 eps` profile after each optimization and compare stage histograms before making any improvement claim
 - run the same profile on stronger local hardware or a cloud deployment where producer, broker, and database capacity can be scaled independently

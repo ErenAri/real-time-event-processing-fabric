@@ -33,7 +33,7 @@ flowchart LR
     GF[Grafana]
 
     PS -->|HTTP events| IS
-    IS -->|append raw payload| RA
+    IS -->|enqueue/write raw payload| RA
     IS -->|publish| K
     K --> SP1
     K --> SPN
@@ -66,7 +66,9 @@ flowchart LR
 
 | Scenario | Artifact | Summary |
 | --- | --- | --- |
-| 2k performance gate | `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json` | `4` producers, `3` processors, target `2,000 eps`; observed `717.1 accepted eps`, `495.08 processed eps`, query `p95 265.82 ms`, drain `39.53s`; target not met |
+| Latest 2k performance gate | `artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json` | `4` producers, `3` processors, target `2,000 eps`; observed `898.67 accepted eps`, `910.44 processed eps`, query `p95 135.03 ms`, drain `2.02s`; throughput target not met |
+| Best 2k gate after hot-path fixes | `artifacts/benchmarks/benchmark-performance-gate-20260423-123425.json` | async archive and set-based aggregate writes; observed `1,308.55 accepted eps`, `1,166.05 processed eps`, query `p95 63.97 ms`, drain `0.01s`; throughput target not met |
+| Pre-fix 2k performance gate | `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json` | target `2,000 eps`; observed `717.1 accepted eps`, `495.08 processed eps`, query `p95 265.82 ms`, drain `39.53s`; target not met |
 | 5k offered-load benchmark | `artifacts/benchmarks/benchmark-20260417-222710.json` | `4` producers, `3` processors, target `5,000 eps`; observed `955.91 accepted eps`, `329.37 processed eps`, query `p95 147.13 ms`, peak lag `10,969`; target not met |
 | Processor restart drill | `artifacts/failure-drills/restart-processor-20260417-225121.json` | `3` processors, `300 eps`; one replica restarted, lag recovered in `6.29s`, final lag `0` |
 | Broker outage drill | `artifacts/failure-drills/broker-outage-20260417-224838.json` | `10s` Kafka outage, archive accounting gap `0`, accepted traffic recovered in `2.09s`, `4,008` explicit publish failures |
@@ -74,7 +76,7 @@ flowchart LR
 | Replay and rebuild drill | `artifacts/failure-drills/replay-archive-20260417193652.json` | `25` duplicate replays produced `0` source-metric overcount; scoped hot-view reset rebuilt processed/source counts back to `25` |
 | Poison-message drill | `artifacts/failure-drills/inject-poison-message-20260417-193308.json` | malformed Kafka record produced `dead_letter_delta: 1` without blocking the processor loop |
 
-Current local evidence is deliberately conservative. Recovery behavior is verified at sustainable rates, but the intermediate `2,000 processed eps` gate and MVP `5,000 eps` throughput target are not yet met on this machine. The current bottleneck is the local write path under high offered load: producer/client timeouts, ingest publish/archive pressure, and PostgreSQL hot-view writes limit accepted and processed throughput. The latest 2k gate also pushed overview query p95 above the `250 ms` target.
+Current local evidence is deliberately conservative. Recovery behavior is verified at sustainable rates, but the intermediate `2,000 processed eps` gate and MVP `5,000 eps` throughput target are not yet met on this machine. The 2026-04-23 fixes removed the raw archive as the dominant synchronous ingest bottleneck and reduced processor window/source write pressure. The remaining bottleneck is the high-load local write path: Kafka publish latency, producer HTTP pressure, and PostgreSQL tenant aggregate spikes limit accepted and processed throughput.
 
 ## Quick start
 
@@ -177,6 +179,7 @@ asyncapi.yaml
 - [API specification](docs/api-spec.md)
 - [Data model](docs/data-model.md)
 - [Processing guarantees](docs/processing-guarantees.md)
+- [Standards gap analysis](docs/standards-gap-analysis.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Failure modes](docs/failure-modes.md)
 - [Runbook](docs/runbook.md)
@@ -199,6 +202,8 @@ asyncapi.yaml
 
 - Redis caching is not part of the current hot path; PostgreSQL remains the only operational read store.
 - Azure dashboard deployment and published Azure benchmark evidence are still follow-on work.
-- The intermediate `2,000 processed eps` gate is not met yet. The latest local gate accepted `717.1 eps` and processed `495.08 eps`; slow stages were ingest archive write, Kafka publish, and PostgreSQL tenant/window aggregate upserts.
+- The intermediate `2,000 processed eps` gate is not met yet. The latest local gate accepted `898.67 eps` and processed `910.44 eps`; the best post-fix local gate accepted `1,308.55 eps` and processed `1,166.05 eps`.
+- The raw archive is asynchronous in the Docker Compose benchmark profile. This improves ingest latency but means archive durability is decoupled from the HTTP response; queue depth and async write counters must be monitored.
+- The optional Kafka publish batcher is implemented behind `KAFKA_PUBLISH_BATCHER_ENABLED`, but it is disabled in the Compose profile because the 2026-04-23 local experiment regressed Kafka publish latency.
 - New archive records use tenant/hour prefixes for scoped replay. Existing date-only archives are still readable, and old replay evidence remains useful as the baseline for why indexing was added.
 - Controlled recovery drills pass at sustainable rates; overload drills are still useful, but should be documented as degraded-mode evidence rather than success evidence.

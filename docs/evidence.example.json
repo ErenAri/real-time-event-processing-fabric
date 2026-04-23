@@ -1,53 +1,52 @@
 ﻿{
     "schema_version":  1,
-    "generated_at":  "2026-04-20T13:13:35.4478712Z",
+    "generated_at":  "2026-04-23T09:57:00.7311913Z",
     "status":  "available",
     "artifact_root":  "artifacts",
     "benchmark":  {
-                      "artifact":  "artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json",
-                      "started_at_utc":  "2026-04-20T13:08:00.3120000Z",
-                      "completed_at_utc":  "2026-04-20T13:09:01.0840000Z",
+                      "artifact":  "artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json",
+                      "started_at_utc":  "2026-04-23T09:50:25.4020000Z",
+                      "completed_at_utc":  "2026-04-23T09:51:26.1430000Z",
                       "target_eps":  2000,
-                      "accepted_eps":  717.1,
-                      "processed_eps":  495.08,
-                      "query_p95_ms":  265.82,
-                      "peak_lag":  5114,
-                      "post_load_drain_seconds":  39.53,
+                      "accepted_eps":  898.67,
+                      "processed_eps":  910.44,
+                      "query_p95_ms":  135.03,
+                      "peak_lag":  0,
+                      "post_load_drain_seconds":  2.02,
                       "producer_count":  4,
                       "processor_replicas":  3,
-                      "summary":  "Accepted 717.1 eps and processed 495.1 eps against a 2,000 eps target using 4 producer(s) and 3 processor replica(s).",
+                      "summary":  "Accepted 898.7 eps and processed 910.4 eps against a 2,000 eps target using 4 producer(s) and 3 processor replica(s).",
                       "gaps":  [
                                    "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck.",
-                                   "Processed throughput is below the next credibility gate of 2,000 eps.",
-                                   "Post-load drain exceeded 30 seconds; processor capacity does not yet clear backlog quickly."
+                                   "Processed throughput is below the next credibility gate of 2,000 eps."
                                ],
                       "gates":  [
                                     {
                                         "name":  "processed_eps_2000",
                                         "status":  "fail",
                                         "target":  2000,
-                                        "observed":  495.08,
+                                        "observed":  910.44,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "processed_eps_5000",
                                         "status":  "fail",
                                         "target":  5000,
-                                        "observed":  495.08,
+                                        "observed":  910.44,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "query_p95_250ms",
-                                        "status":  "fail",
+                                        "status":  "pass",
                                         "target":  250,
-                                        "observed":  265.82,
+                                        "observed":  135.03,
                                         "unit":  "ms"
                                     },
                                     {
                                         "name":  "post_load_drain_30s",
-                                        "status":  "fail",
+                                        "status":  "pass",
                                         "target":  30,
-                                        "observed":  39.53,
+                                        "observed":  2.02,
                                         "unit":  "s"
                                     }
                                 ]
@@ -150,7 +149,7 @@
                                "completed_at_utc":  "2026-04-17T19:39:36.2735920Z",
                                "result":  "Duplicate-safe: True; rebuild restored: True.",
                                "operator_note":  "Replay republishes archive records through the same Kafka and processor path.",
-                               "remaining_gap":  "The flat archive is date-partitioned only, so selective tenant replay still scans too many records.",
+                               "remaining_gap":  "Repeat replay drills against the tenant/hour indexed archive layout under larger data volumes.",
                                "metrics":  [
                                                {
                                                    "label":  "replayed duplicates",

@@ -348,7 +348,7 @@ function New-DrillEvidence {
                 completed_at_utc = $completedAt
                 result = "Duplicate-safe: $duplicateSafe; rebuild restored: $rebuildRestored."
                 operator_note = "Replay republishes archive records through the same Kafka and processor path."
-                remaining_gap = "The flat archive is date-partitioned only, so selective tenant replay still scans too many records."
+                remaining_gap = "Repeat replay drills against the tenant/hour indexed archive layout under larger data volumes."
                 metrics = @(
                     New-Metric "replayed duplicates" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "replay_response_replayed") 0)
                     New-Metric "duplicate delta" (Format-EvidenceNumber (Get-NumberValue -Object $report -Name "verifier_duplicate_delta_after_replay") 0)
