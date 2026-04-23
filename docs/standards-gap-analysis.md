@@ -22,15 +22,17 @@ PulseStream has credible custom streaming-system evidence in these areas:
 - event-time windows with allowed lateness
 - duplicate suppression by `event_id`
 - raw archive replay with tenant/hour prefixes for new data
+- batch ingest for production-shaped producer traffic
 - Prometheus metrics, structured logs, dashboard evidence, and failure-drill artifacts
 - tenant-scoped auth and PostgreSQL row-level security
 
-The throughput evidence is still below the target:
+The throughput evidence now clears the intermediate local target and narrowly misses the MVP target:
 
-- Latest 2k gate: `898.67 accepted eps`, `910.44 processed eps`, query p95 `135.03 ms`, drain `2.02s`
-- Best post-fix 2k gate: `1,308.55 accepted eps`, `1,166.05 processed eps`, query p95 `63.97 ms`, drain `0.01s`
-- Target not met: `2,000 processed eps`
-- MVP target not met: `5,000 processed eps`
+- Latest batch 5k run: `4,980.08 accepted eps`, `4,962.23 processed eps`, query p95 `52.19 ms`, drain `3.59s`
+- Latest batch 2k gate: `1,973.53 accepted eps`, `2,030.64 processed eps`, query p95 `26.24 ms`, drain `0.01s`
+- Previous one-event 2k gate: `898.67 accepted eps`, `910.44 processed eps`, query p95 `135.03 ms`, drain `2.02s`
+- Intermediate target met: `2,000 processed eps`
+- MVP target narrowly not met: `5,000 processed eps`
 
 ## Standards Baseline
 
@@ -55,12 +57,12 @@ Kafka Streams standard:
 
 | Area | PulseStream now | Standard expectation | Gap | Priority |
 | --- | --- | --- | --- | --- |
-| Sustained throughput | Best post-fix result is `1,166.05 processed eps` against a `2,000 eps` gate | Clear sustained throughput with repeatable pass/fail gates | 2k and 5k targets are not met | P0 |
-| Benchmark repeatability | Multiple 2026-04-23 runs vary from `910` to `1,166 processed eps` | Low-variance benchmark profile with pinned resources and clean start state | Docker Desktop/local hardware noise is high; artifacts are useful but not stable enough for a headline claim | P0 |
-| Ingest publish path | One HTTP request produces one Kafka publish operation; optional batcher exists but is disabled after regression | High-throughput producers usually batch records and tune broker/client I/O | Kafka publish p95 remains high under load, up to `1738.8 ms` in the latest gate | P0 |
+| Sustained throughput | Latest batch result is `4,962.23 processed eps` against a `5,000 eps` gate | Clear sustained throughput with repeatable pass/fail gates | 2k is met; 5k is close but not met | P0 |
+| Benchmark repeatability | One batch 2k pass and one near-5k run exist after earlier 2026-04-23 runs varied from `910` to `1,166 processed eps` | Low-variance benchmark profile with pinned resources and clean start state | The near-5k result needs repeat runs on clean state before it becomes a headline capacity claim | P0 |
+| Ingest publish path | Batch ingest endpoint is implemented and benchmarked at `4,962.23 processed eps` | High-throughput producers usually batch records and tune broker/client I/O | 5k pass and ingest scale-out remain unproven | P0 |
 | Ingest scale-out | One exposed ingest-service instance in Compose | Stateless ingest should scale horizontally behind a load balancer | Compose profile cannot scale ingest because host port binding is tied to one container | P0 |
-| Producer realism | Synthetic producers issue per-event HTTP calls | Production producers often use batch APIs, persistent clients, and controlled payload distributions | Producer/client pressure is part of the measured bottleneck | P0 |
-| Tenant aggregate hot spot | Tenant aggregate upsert p95 remains `650.45 ms` latest and `746 ms` best post-fix | Stateful processors avoid central DB hot-row contention with local state/changelog or staged merges | PostgreSQL tenant metrics are still a high-contention write path | P0 |
+| Producer realism | Simulator supports `SIM_BATCH_SIZE`; latest gate used `4` producers and batch size `25` | Production producers often use batch APIs, persistent clients, and controlled payload distributions | Payload distributions and client connection behavior are still synthetic | P1 |
+| Tenant aggregate hot spot | Latest 5k batch tenant aggregate upsert p95 is `558.48 ms`; the 2k batch p95 was `104.15 ms` | Stateful processors avoid central DB hot-row contention with local state/changelog or staged merges | PostgreSQL tenant metrics remain centralized and dominate at higher load | P0 |
 | State backend | PostgreSQL stores dedup, hot aggregates, windows, and service state | Flink/Kafka Streams use keyed/local state plus checkpoints/changelogs | Durable state is simple and inspectable, but DB pressure limits throughput | P0 |
 | Checkpointing | Offsets commit after DB/DLQ success; no distributed checkpoints | Flink checkpoints snapshot operator state and input positions consistently | No checkpoint coordinator, barriers, or savepoints | P1 |
 | Exactly-once | Idempotent at-least-once with dedup | Kafka Streams exactly-once can atomically coordinate Kafka offsets, state stores, and Kafka outputs | No cross-system transaction between Kafka and PostgreSQL | P1 |
@@ -73,7 +75,7 @@ Kafka Streams standard:
 | Backpressure model | In-flight limits, Kafka publish latency, and rejection metrics exist | Production stream systems expose explicit queue, mailbox, watermark, and sink backpressure | Backpressure is observable but not yet modeled end-to-end in docs or dashboard | P1 |
 | Archive durability | Compose uses async archive queue for throughput | Cold storage writes should have explicit durability guarantees and retry behavior | Async archive durability is decoupled from HTTP response; queue overflow policy must be tested under sustained overload | P1 |
 | Replay efficiency | New archives use date/tenant/hour layout; legacy fallback exists | Production replay should have selective indexes, progress, cancellation, and rate limits | Replay still scans files within selected hour prefixes and lacks resumable job state | P1 |
-| Failure drills after new fixes | Existing drills cover restart, broker outage, Postgres pause, replay, poison message | Failure evidence should be rerun after major hot-path changes | 2k gate failed, so new overload-level failure drills were intentionally skipped | P1 |
+| Failure drills after new fixes | Existing drills cover restart, broker outage, Postgres pause, replay, poison message | Failure evidence should be rerun after major hot-path changes | The 2k batch gate now passes, so post-batch failure drills should be rerun | P1 |
 | Chaos coverage | Scripts exist for key scenarios | Production systems test dependency slowness, network partitions, broker ISR loss, disk pressure, and rolling deploys | Current drills do not cover broker disk pressure, partition loss, slow Kafka acks, or rolling deployment | P2 |
 | Observability depth | Prometheus metrics, structured logs, traces hooks, evidence API | Production standard includes trace correlation through ingest, Kafka, processor, DB, and dashboard queries | Trace evidence is not yet captured as a published artifact | P2 |
 | Alerting | Alerts exist in Prometheus config | Operational alerts should be tied to SLOs and runbook actions | Alert thresholds are not yet validated against benchmark and chaos data | P2 |
@@ -94,16 +96,17 @@ Kafka Streams standard:
 - File archive writes no longer reopen the active tenant/hour file for every mixed-tenant event.
 - Processor aggregate writes use set-based upserts instead of one statement per aggregate key.
 - Processor window/source stage latency improved materially compared with the pre-fix 2k gate.
-- Query p95 and post-load drain now pass in the latest 2k evidence, even though throughput does not.
+- Query p95 and post-load drain pass in the latest 5k batch evidence.
 - Optional Kafka publish batching was tested and kept disabled because it regressed local evidence.
+- Batch ingest was added and raised the latest local benchmark to `4,962.23 processed eps` with batch size `25`.
 
 ## Recommended Next Work
 
-1. Build a real ingest batch endpoint and update the simulator to send batches with one HTTP request per N events. This directly addresses the measured producer/HTTP/Kafka publish bottleneck.
+1. Repeat the 5k batch benchmark on clean state at least three times and record variance.
 2. Add an ingest load balancer service in Compose so `ingest-service` can scale horizontally without host port conflicts.
 3. Replace tenant aggregate direct upserts with a staging-table merge or partitioned hot tables to reduce tenant-row contention.
-4. Add a clean benchmark profile that starts from isolated Compose project names or explicitly reset volumes only when requested.
-5. Rerun the 2k gate and only rerun overload-level failure drills after the 2k gate passes.
+4. Rerun the 5k benchmark after the tenant aggregate fix and compare accepted eps, processed eps, tenant aggregate p95, and drain time.
+5. Rerun overload-level failure drills against the batch profile.
 6. Add a capacity model that ties topic partitions, processor replicas, DB write latency, and expected EPS together.
 7. Add retention jobs for `processed_events`, `tenant_metrics`, `source_metrics`, and `event_windows`.
 8. Publish trace evidence for one accepted event through ingest, Kafka, processor, DB write, and dashboard query.
@@ -111,8 +114,8 @@ Kafka Streams standard:
 
 ## Assessment
 
-PulseStream is above a student demo because it has real Kafka ingestion, idempotent processing, event-time windows, replay, failure drills, tenant isolation, and evidence artifacts. It is not yet at the senior-level performance bar because the throughput gate is still failing and the state model is DB-centered rather than framework-grade keyed state with checkpoints or changelogs.
+PulseStream is above a student demo because it has real Kafka ingestion, idempotent processing, event-time windows, replay, failure drills, tenant isolation, and evidence artifacts. It now clears the intermediate local 2k processed-eps gate and nearly reaches 5k, but it is not yet at the strongest senior-level performance bar because the 5k pass, repeatability, cloud evidence, and framework-grade keyed state/checkpoint semantics remain open.
 
 The strongest honest positioning is:
 
-> Built a custom Go/Kafka real-time analytics platform with idempotent at-least-once processing, event-time windows, tenant-scoped APIs, observability, replay, and failure-drill evidence; current local benchmark reaches up to `1,166 processed eps` against a `2,000 eps` gate, with documented bottlenecks and next optimizations.
+> Built a custom Go/Kafka real-time analytics platform with idempotent at-least-once processing, event-time windows, tenant-scoped APIs, observability, replay, and failure-drill evidence; current local batch benchmark reaches `4,962 processed eps` against a `5,000 eps` target, with documented repeatability, tenant-aggregate, and state-model gaps.

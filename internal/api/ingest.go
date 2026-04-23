@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -37,6 +38,16 @@ type RawReplayer interface {
 	) (eventarchive.ReplayResult, error)
 }
 
+type BatchPublisher interface {
+	PublishEvents(ctx context.Context, events []events.TelemetryEvent) error
+}
+
+const (
+	singleEventBodyLimitBytes = 1 << 20
+	batchEventBodyLimitBytes  = 8 << 20
+	maxBatchEvents            = 500
+)
+
 type IngestHandler struct {
 	logger         *slog.Logger
 	publisher      platform.EventPublisher
@@ -57,6 +68,7 @@ type IngestHandler struct {
 	validationDuration prometheus.Histogram
 	publishDuration    prometheus.Histogram
 	archiveDuration    prometheus.Histogram
+	batchSizeHistogram prometheus.Histogram
 	acceptedCounter    prometheus.Counter
 	archivedCounter    prometheus.Counter
 	replayCounter      prometheus.Counter
@@ -103,6 +115,11 @@ func NewIngestHandler(
 			Help:    "Duration of the ingest archive step for valid events. In async mode this is enqueue latency.",
 			Buckets: prometheus.DefBuckets,
 		}),
+		batchSizeHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "pulsestream_ingest_batch_size",
+			Help:    "Number of telemetry events accepted per ingest request.",
+			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500},
+		}),
 		acceptedCounter: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pulsestream_ingest_accepted_total",
 			Help: "Number of accepted events.",
@@ -130,6 +147,7 @@ func NewIngestHandler(
 		handler.validationDuration,
 		handler.publishDuration,
 		handler.archiveDuration,
+		handler.batchSizeHistogram,
 		handler.acceptedCounter,
 		handler.archivedCounter,
 		handler.replayCounter,
@@ -150,6 +168,7 @@ func (h *IngestHandler) SetMaxInFlight(limit int) {
 
 func (h *IngestHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/events", h.handleEvents)
+	mux.HandleFunc("/api/v1/events/batch", h.handleEventBatch)
 	mux.HandleFunc("/api/v1/admin/replay", h.handleReplay)
 }
 
@@ -173,7 +192,7 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, singleEventBodyLimitBytes))
 	if err != nil {
 		h.reject(r.Context(), body, "", "", "read_body_failed")
 		platform.WriteError(w, http.StatusBadRequest, "unable to read request body")
@@ -236,11 +255,133 @@ func (h *IngestHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	h.publishDuration.Observe(time.Since(publishStart).Seconds())
 	h.acceptedCounter.Inc()
 	h.acceptedTotal.Add(1)
+	h.batchSizeHistogram.Observe(1)
 
 	platform.WriteJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "accepted",
 		"event_id":  event.EventID,
 		"tenant_id": event.TenantID,
+	})
+}
+
+func (h *IngestHandler) handleEventBatch(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		h.requestDuration.Observe(time.Since(start).Seconds())
+	}()
+
+	if r.Method != http.MethodPost {
+		platform.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, batchEventBodyLimitBytes))
+	if err != nil {
+		h.reject(r.Context(), body, "", "", "read_body_failed")
+		platform.WriteError(w, http.StatusBadRequest, "unable to read request body")
+		return
+	}
+
+	validationStart := time.Now()
+	observeValidation := func() {
+		h.validationDuration.Observe(time.Since(validationStart).Seconds())
+	}
+
+	var rawEvents []json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&rawEvents); err != nil {
+		observeValidation()
+		h.reject(r.Context(), body, "", "", "decode_failed")
+		platform.WriteError(w, http.StatusBadRequest, "batch payload must be a JSON array of events")
+		return
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		observeValidation()
+		h.reject(r.Context(), body, "", "", "decode_failed")
+		platform.WriteError(w, http.StatusBadRequest, "batch payload must contain exactly one JSON array")
+		return
+	}
+	if len(rawEvents) == 0 {
+		observeValidation()
+		h.reject(r.Context(), body, "", "", "validation_failed")
+		platform.WriteError(w, http.StatusBadRequest, "batch payload must contain at least one event")
+		return
+	}
+	if len(rawEvents) > maxBatchEvents {
+		observeValidation()
+		h.reject(r.Context(), body, "", "", "validation_failed")
+		platform.WriteError(w, http.StatusBadRequest, "batch payload exceeds maximum event count")
+		return
+	}
+
+	principal, err := h.authenticateRequest(r)
+	if err != nil {
+		observeValidation()
+		platform.WriteError(w, http.StatusUnauthorized, "bearer token is required")
+		return
+	}
+
+	decodedEvents := make([]events.TelemetryEvent, 0, len(rawEvents))
+	for _, rawEvent := range rawEvents {
+		event, err := events.DecodeTelemetryEvent(rawEvent)
+		if err != nil {
+			observeValidation()
+			h.reject(r.Context(), rawEvent, "", "", "decode_failed")
+			platform.WriteError(w, http.StatusBadRequest, "invalid event payload in batch")
+			return
+		}
+		if !h.authorizePrincipalForTenant(w, principal, event.TenantID) {
+			observeValidation()
+			return
+		}
+		if err := event.Validate(); err != nil {
+			observeValidation()
+			h.reject(r.Context(), rawEvent, event.TenantID, event.SourceID, "validation_failed")
+			platform.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		decodedEvents = append(decodedEvents, event)
+	}
+	observeValidation()
+
+	ctx := auth.ContextWithPrincipal(r.Context(), principal)
+	if !h.tryAcquireInFlight() {
+		h.reject(ctx, body, "", "", "backpressure")
+		platform.WriteError(w, http.StatusServiceUnavailable, "ingest service is overloaded")
+		return
+	}
+	defer h.releaseInFlight()
+
+	if h.archiver != nil {
+		archiveStart := time.Now()
+		for i, event := range decodedEvents {
+			if err := h.archiver.Archive(ctx, event, rawEvents[i]); err != nil {
+				h.reject(ctx, rawEvents[i], event.TenantID, event.SourceID, "archive_failed")
+				h.logger.Error("archive_event_failed", "error", err, "tenant_id", event.TenantID, "source_id", event.SourceID)
+				platform.WriteError(w, http.StatusBadGateway, "failed to archive event batch")
+				return
+			}
+		}
+		h.archiveDuration.Observe(time.Since(archiveStart).Seconds())
+		h.archivedCounter.Add(float64(len(decodedEvents)))
+	}
+
+	publishStart := time.Now()
+	if err := h.publishEvents(ctx, decodedEvents); err != nil {
+		h.reject(ctx, body, "", "", "publish_failed")
+		h.logger.Error("publish_event_batch_failed", "error", err, "event_count", len(decodedEvents))
+		platform.WriteError(w, http.StatusBadGateway, "failed to publish event batch")
+		return
+	}
+	h.publishDuration.Observe(time.Since(publishStart).Seconds())
+	h.acceptedCounter.Add(float64(len(decodedEvents)))
+	h.acceptedTotal.Add(int64(len(decodedEvents)))
+	h.batchSizeHistogram.Observe(float64(len(decodedEvents)))
+
+	platform.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"status":         "accepted",
+		"accepted_count": len(decodedEvents),
 	})
 }
 
@@ -361,19 +502,38 @@ func (h *IngestHandler) authorizeEventIngest(w http.ResponseWriter, r *http.Requ
 		return auth.Principal{}, false
 	}
 
+	if !h.authorizePrincipalForTenant(w, principal, tenantID) {
+		return auth.Principal{}, false
+	}
+	return principal, true
+}
+
+func (h *IngestHandler) authorizePrincipalForTenant(w http.ResponseWriter, principal auth.Principal, tenantID string) bool {
 	switch principal.Role {
 	case auth.RoleAdmin:
-		return principal, true
+		return true
 	case auth.RoleTenantUser:
 		if strings.TrimSpace(tenantID) == "" || principal.TenantID != strings.TrimSpace(tenantID) {
 			platform.WriteError(w, http.StatusForbidden, "token tenant does not match event tenant")
-			return auth.Principal{}, false
+			return false
 		}
-		return principal, true
+		return true
 	default:
 		platform.WriteError(w, http.StatusForbidden, "role is not allowed to publish events")
-		return auth.Principal{}, false
+		return false
 	}
+}
+
+func (h *IngestHandler) publishEvents(ctx context.Context, eventList []events.TelemetryEvent) error {
+	if batchPublisher, ok := h.publisher.(BatchPublisher); ok {
+		return batchPublisher.PublishEvents(ctx, eventList)
+	}
+	for _, event := range eventList {
+		if err := h.publisher.PublishEvent(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (h *IngestHandler) authorizeReplay(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {

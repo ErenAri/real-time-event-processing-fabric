@@ -30,6 +30,7 @@ type Benchmark struct {
 	PostLoadDrainSeconds float64  `json:"post_load_drain_seconds"`
 	ProducerCount        int      `json:"producer_count"`
 	Replicas             int      `json:"processor_replicas"`
+	BatchSize            int      `json:"batch_size"`
 	Summary              string   `json:"summary"`
 	Gaps                 []string `json:"gaps"`
 	Gates                []Gate   `json:"gates"`

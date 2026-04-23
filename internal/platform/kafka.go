@@ -108,26 +108,59 @@ func (p *KafkaPublisher) PublishEvent(ctx context.Context, event events.Telemetr
 	return p.writeEvent(ctx, event)
 }
 
+func (p *KafkaPublisher) PublishEvents(ctx context.Context, eventList []events.TelemetryEvent) error {
+	if len(eventList) == 0 {
+		return nil
+	}
+	if len(eventList) == 1 {
+		return p.PublishEvent(ctx, eventList[0])
+	}
+	return p.writeEvents(ctx, eventList)
+}
+
 func (p *KafkaPublisher) writeEvent(ctx context.Context, event events.TelemetryEvent) error {
-	payload, err := json.Marshal(event)
+	return p.writeEvents(ctx, []events.TelemetryEvent{event})
+}
+
+func (p *KafkaPublisher) writeEvents(ctx context.Context, eventList []events.TelemetryEvent) error {
+	if len(eventList) == 0 {
+		return nil
+	}
+
+	messages := make([]kafka.Message, 0, len(eventList))
+	spans := make([]trace.Span, 0, len(eventList))
+	for _, event := range eventList {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			for _, span := range spans {
+				telemetry.RecordSpanError(span, err)
+				span.End()
+			}
+			return fmt.Errorf("marshal event: %w", err)
+		}
+
+		spanCtx, span := telemetry.StartKafkaProducerSpan(ctx, p.topic, []byte(event.PartitionKey()), len(payload), event.EventID, p.brokers)
+		message := kafka.Message{
+			Key:   []byte(event.PartitionKey()),
+			Value: payload,
+			Time:  event.Timestamp,
+		}
+		telemetry.InjectKafkaHeaders(spanCtx, &message.Headers)
+		messages = append(messages, message)
+		spans = append(spans, span)
+	}
+
+	err := p.writer.WriteMessages(ctx, messages...)
 	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
+		err = fmt.Errorf("publish to kafka: %w", err)
 	}
-
-	ctx, span := telemetry.StartKafkaProducerSpan(ctx, p.topic, []byte(event.PartitionKey()), len(payload), event.EventID, p.brokers)
-	defer span.End()
-
-	message := kafka.Message{
-		Key:   []byte(event.PartitionKey()),
-		Value: payload,
-		Time:  event.Timestamp,
+	for _, span := range spans {
+		if err != nil {
+			telemetry.RecordSpanError(span, err)
+		}
+		span.End()
 	}
-	telemetry.InjectKafkaHeaders(ctx, &message.Headers)
-	if err := p.writer.WriteMessages(ctx, message); err != nil {
-		telemetry.RecordSpanError(span, err)
-		return fmt.Errorf("publish to kafka: %w", err)
-	}
-	return nil
+	return err
 }
 
 func (p *KafkaPublisher) startBatcher(config KafkaPublisherConfig) {

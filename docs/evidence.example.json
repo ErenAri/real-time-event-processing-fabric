@@ -1,52 +1,52 @@
 ﻿{
     "schema_version":  1,
-    "generated_at":  "2026-04-23T09:57:00.7311913Z",
+    "generated_at":  "2026-04-23T10:28:05.4644939Z",
     "status":  "available",
     "artifact_root":  "artifacts",
     "benchmark":  {
-                      "artifact":  "artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json",
-                      "started_at_utc":  "2026-04-23T09:50:25.4020000Z",
-                      "completed_at_utc":  "2026-04-23T09:51:26.1430000Z",
-                      "target_eps":  2000,
-                      "accepted_eps":  898.67,
-                      "processed_eps":  910.44,
-                      "query_p95_ms":  135.03,
-                      "peak_lag":  0,
-                      "post_load_drain_seconds":  2.02,
+                      "artifact":  "artifacts/benchmarks/benchmark-20260423-132558.json",
+                      "started_at_utc":  "2026-04-23T10:26:34.6540000Z",
+                      "completed_at_utc":  "2026-04-23T10:27:34.8930000Z",
+                      "target_eps":  5000,
+                      "accepted_eps":  4980.08,
+                      "processed_eps":  4962.23,
+                      "query_p95_ms":  52.19,
+                      "peak_lag":  163,
+                      "post_load_drain_seconds":  3.59,
                       "producer_count":  4,
                       "processor_replicas":  3,
-                      "summary":  "Accepted 898.7 eps and processed 910.4 eps against a 2,000 eps target using 4 producer(s) and 3 processor replica(s).",
+                      "batch_size":  25,
+                      "summary":  "Accepted 4,980.1 eps and processed 4,962.2 eps against a 5,000 eps target using 4 producer(s), 3 processor replica(s), and batch size 25.",
                       "gaps":  [
-                                   "Accepted throughput is below 80 percent of target; producer or ingest path is still the bottleneck.",
-                                   "Processed throughput is below the next credibility gate of 2,000 eps."
+                                   "Processed throughput cleared the 2,000 eps gate but remains below the MVP target of 5,000 eps."
                                ],
                       "gates":  [
                                     {
                                         "name":  "processed_eps_2000",
-                                        "status":  "fail",
+                                        "status":  "pass",
                                         "target":  2000,
-                                        "observed":  910.44,
+                                        "observed":  4962.23,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "processed_eps_5000",
                                         "status":  "fail",
                                         "target":  5000,
-                                        "observed":  910.44,
+                                        "observed":  4962.23,
                                         "unit":  "eps"
                                     },
                                     {
                                         "name":  "query_p95_250ms",
                                         "status":  "pass",
                                         "target":  250,
-                                        "observed":  135.03,
+                                        "observed":  52.19,
                                         "unit":  "ms"
                                     },
                                     {
                                         "name":  "post_load_drain_30s",
                                         "status":  "pass",
                                         "target":  30,
-                                        "observed":  2.02,
+                                        "observed":  3.59,
                                         "unit":  "s"
                                     }
                                 ]

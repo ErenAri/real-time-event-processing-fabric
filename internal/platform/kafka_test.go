@@ -72,6 +72,60 @@ func TestKafkaPublisherInjectsTraceContextHeaders(t *testing.T) {
 	}
 }
 
+func TestKafkaPublisherPublishesEventBatchInSingleWrite(t *testing.T) {
+	restore := installKafkaTestTelemetry(t)
+	defer restore()
+
+	writer := &fakeKafkaWriter{}
+	publisher := &KafkaPublisher{
+		writer:  writer,
+		topic:   "pulsestream.events",
+		brokers: []string{"kafka:9092"},
+	}
+
+	err := publisher.PublishEvents(context.Background(), []events.TelemetryEvent{
+		{
+			SchemaVersion: events.CurrentSchemaVersion,
+			EventID:       "evt-1",
+			TenantID:      "tenant_01",
+			SourceID:      "sensor_01",
+			EventType:     "telemetry",
+			Timestamp:     time.Now().UTC(),
+			Value:         12.5,
+			Status:        events.StatusOK,
+			Region:        "eu-west",
+			Sequence:      1,
+		},
+		{
+			SchemaVersion: events.CurrentSchemaVersion,
+			EventID:       "evt-2",
+			TenantID:      "tenant_01",
+			SourceID:      "sensor_02",
+			EventType:     "telemetry",
+			Timestamp:     time.Now().UTC(),
+			Value:         13.5,
+			Status:        events.StatusWarn,
+			Region:        "eu-west",
+			Sequence:      2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish event batch: %v", err)
+	}
+
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if len(writer.messages) != 2 {
+		t.Fatalf("expected two published messages, got %d", len(writer.messages))
+	}
+	if findHeaderValue(writer.messages[0].Headers, "traceparent") == "" {
+		t.Fatal("expected traceparent header to be present on first message")
+	}
+	if findHeaderValue(writer.messages[1].Headers, "traceparent") == "" {
+		t.Fatal("expected traceparent header to be present on second message")
+	}
+}
+
 func TestKafkaPublisherBatcherWritesMultipleMessages(t *testing.T) {
 	restore := installKafkaTestTelemetry(t)
 	defer restore()

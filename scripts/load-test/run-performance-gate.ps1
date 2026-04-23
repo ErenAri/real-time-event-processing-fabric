@@ -4,6 +4,7 @@ param(
     [int]$WarmupSeconds = 10,
     [int]$ProcessorReplicas = 3,
     [int]$ProducerCount = 4,
+    [int]$BatchSize = 25,
     [int]$MaxInFlight = 768,
     [int]$TenantCount = 50,
     [int]$SourcesPerTenant = 200,
@@ -97,6 +98,7 @@ try {
         -WarmupSeconds $WarmupSeconds `
         -ProcessorReplicas $ProcessorReplicas `
         -ProducerCount $ProducerCount `
+        -BatchSize $BatchSize `
         -MaxInFlight $MaxInFlight `
         -TenantCount $TenantCount `
         -SourcesPerTenant $SourcesPerTenant `
@@ -116,6 +118,7 @@ try {
         processor_replicas = $ProcessorReplicas
         producer_count = $ProducerCount
         max_in_flight_per_producer = $MaxInFlight
+        batch_size = $BatchSize
     })
     $report | ConvertTo-Json -Depth 10 | Set-Content -Path $reportPath
 

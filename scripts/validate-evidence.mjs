@@ -62,6 +62,7 @@ function validateBenchmark(benchmark, context) {
   requireNumber(benchmark, "post_load_drain_seconds", context);
   requireNumber(benchmark, "producer_count", context);
   requireNumber(benchmark, "processor_replicas", context);
+  requireNumber(benchmark, "batch_size", context);
   requireString(benchmark, "summary", context);
   assert(Array.isArray(benchmark.gaps), `${context}.gaps must be an array`);
   benchmark.gaps.forEach((gap, index) => {

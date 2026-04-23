@@ -3,6 +3,7 @@ param(
     [string]$ProducerMode = "compose",
     [int]$Rate = 5000,
     [int]$ProducerCount = 1,
+    [int]$BatchSize = 1,
     [int]$ProducerPortStart = 18083,
     [int]$DurationSeconds = 60,
     [int]$WarmupSeconds = 5,
@@ -45,6 +46,17 @@ if ([string]::IsNullOrWhiteSpace($BearerToken)) {
 
 if ($ProducerCount -lt 1) {
     throw "ProducerCount must be greater than or equal to 1."
+}
+if ($BatchSize -lt 1) {
+    throw "BatchSize must be greater than or equal to 1."
+}
+if ($BatchSize -gt 1) {
+    if ($Endpoint.TrimEnd("/") -ieq "http://localhost:8080/api/v1/events") {
+        $Endpoint = "http://localhost:8080/api/v1/events/batch"
+    }
+    if ($ComposeIngestEndpoint.TrimEnd("/") -ieq "http://ingest-service:8080/api/v1/events") {
+        $ComposeIngestEndpoint = "http://ingest-service:8080/api/v1/events/batch"
+    }
 }
 
 function Get-ProducerRate {
@@ -487,6 +499,7 @@ function Get-BenchmarkSample {
 function Save-Environment {
     return @{
         SIM_RATE_PER_SEC         = $env:SIM_RATE_PER_SEC
+        SIM_BATCH_SIZE           = $env:SIM_BATCH_SIZE
         SIM_TENANT_COUNT         = $env:SIM_TENANT_COUNT
         SIM_SOURCES_PER_TENANT   = $env:SIM_SOURCES_PER_TENANT
         SIM_MAX_IN_FLIGHT        = $env:SIM_MAX_IN_FLIGHT
@@ -634,6 +647,7 @@ try {
             $healthUrl = $SimulatorHealthEndpoint
 
             $env:SIM_RATE_PER_SEC = "$producerRate"
+            $env:SIM_BATCH_SIZE = "$BatchSize"
             $env:SIM_TENANT_COUNT = "$TenantCount"
             $env:SIM_SOURCES_PER_TENANT = "$SourcesPerTenant"
             $env:SIM_MAX_IN_FLIGHT = "$MaxInFlight"
@@ -703,6 +717,7 @@ try {
                 "-e", "SIM_INGEST_ENDPOINT=$ComposeIngestEndpoint",
                 "-e", "SIM_BEARER_TOKEN=$BearerToken",
                 "-e", "SIM_RATE_PER_SEC=$producerRate",
+                "-e", "SIM_BATCH_SIZE=$BatchSize",
                 "-e", "SIM_TENANT_COUNT=$TenantCount",
                 "-e", "SIM_SOURCES_PER_TENANT=$SourcesPerTenant",
                 "-e", "SIM_MAX_IN_FLIGHT=$MaxInFlight",
@@ -870,6 +885,7 @@ $benchmarkGates = @(
 $report = [ordered]@{
     producer_mode               = $ProducerMode
     producer_count              = $ProducerCount
+    batch_size                  = $BatchSize
     started_at_utc              = $startSample.timestamp_utc
     completed_at_utc            = $endSample.timestamp_utc
     measured_duration_seconds   = $measuredSeconds
@@ -937,6 +953,7 @@ Write-Host ""
 Write-Host "Benchmark report written to $reportPath"
 Write-Host ("Producer Mode       : {0}" -f $report.producer_mode)
 Write-Host ("Producer Count      : {0}" -f $report.producer_count)
+Write-Host ("Batch Size          : {0}" -f $report.batch_size)
 Write-Host ("Processor Replicas  : {0}" -f $report.processor_replicas_observed)
 Write-Host ("Producer EPS        : {0}" -f $report.producer_sent_eps)
 Write-Host ("Accepted EPS        : {0}" -f $report.accepted_eps)
@@ -948,7 +965,7 @@ Write-Host ("Peak P95 ms         : {0}" -f $report.peak_processing_p95_ms)
 Write-Host ("Peak P99 ms         : {0}" -f $report.peak_processing_p99_ms)
 Write-Host ("Query P95 ms        : {0}" -f $report.query_latency_p95_ms)
 Write-Host ("Post-load drain s   : {0}" -f $report.post_load_drain_seconds)
-Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | {7} | {8} producers, mode {9}, replicas {10}, max_in_flight/producer {11} |" -f `
+Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | {7} | {8} producers, mode {9}, replicas {10}, max_in_flight/producer {11}, batch_size {12} |" -f `
     (Get-Date -Format "yyyy-MM-dd"), `
     $Rate, `
     [Math]::Round($measuredSeconds, 0), `
@@ -960,7 +977,8 @@ Write-Host ("Markdown row        : | {0} | {1} | {2}s | {3} | {4} | {5} | {6} | 
     $report.producer_count, `
     $report.producer_mode, `
     $report.processor_replicas_observed, `
-    $report.max_in_flight_per_producer)
+    $report.max_in_flight_per_producer, `
+    $report.batch_size)
 
 $evidenceScript = Join-Path $repoRoot "scripts/evidence/update-evidence.ps1"
 if (Test-Path $evidenceScript) {

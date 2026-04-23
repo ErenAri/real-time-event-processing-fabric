@@ -5,6 +5,7 @@
 | Service | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- | --- |
 | `ingest-service` | `POST` | `/api/v1/events` | bearer JWT | Accept one telemetry event |
+| `ingest-service` | `POST` | `/api/v1/events/batch` | bearer JWT | Accept a bounded batch of telemetry events |
 | `ingest-service` | `POST` | `/api/v1/admin/replay` | admin token or admin bearer JWT | Replay archived events back into Kafka |
 | `query-service` | `GET` | `/api/v1/metrics/overview` | bearer JWT | Return platform-wide overview metrics |
 | `query-service` | `GET` | `/api/v1/metrics/tenants/{tenantId}` | bearer JWT | Return tenant bucket series |
@@ -67,6 +68,54 @@ Typical rejection:
 ```json
 {
   "error": "invalid event payload"
+}
+```
+
+## Ingest event batch
+
+### `POST /api/v1/events/batch`
+
+Accepts a JSON array of telemetry events and returns `202 Accepted` when every event is validated, accepted by the archive step, and published to Kafka. The current maximum batch size is `500` events. Batch ingest is all-or-nothing at the API boundary: if any event fails schema validation or tenant authorization, the request is rejected and no events from that request are intentionally published.
+
+`tenant_user` tokens may only submit events for their assigned `tenant_id`. Admin tokens may submit mixed-tenant batches.
+
+Request body:
+
+```json
+[
+  {
+    "schema_version": 1,
+    "event_id": "tenant_01-sensor_001-42",
+    "tenant_id": "tenant_01",
+    "source_id": "sensor_001",
+    "event_type": "telemetry",
+    "timestamp": "2026-04-10T10:15:00Z",
+    "value": 73.4,
+    "status": "ok",
+    "region": "eu-west",
+    "sequence": 42
+  },
+  {
+    "schema_version": 1,
+    "event_id": "tenant_01-sensor_002-43",
+    "tenant_id": "tenant_01",
+    "source_id": "sensor_002",
+    "event_type": "telemetry",
+    "timestamp": "2026-04-10T10:15:01Z",
+    "value": 81.7,
+    "status": "warn",
+    "region": "eu-west",
+    "sequence": 43
+  }
+]
+```
+
+Successful response:
+
+```json
+{
+  "status": "accepted",
+  "accepted_count": 2
 }
 ```
 

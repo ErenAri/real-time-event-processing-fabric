@@ -37,6 +37,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	batchSize, err := platform.EnvInt("SIM_BATCH_SIZE", 1)
+	if err != nil {
+		return err
+	}
 	tenantCount, err := platform.EnvInt("SIM_TENANT_COUNT", 5)
 	if err != nil {
 		return err
@@ -88,6 +92,7 @@ func run() error {
 		BearerToken:      bearerToken,
 		ProducerID:       producerID,
 		RatePerSecond:    ratePerSecond,
+		BatchSize:        batchSize,
 		TenantCount:      tenantCount,
 		SourcesPerTenant: sourcesPerTenant,
 		MaxInFlight:      maxInFlight,
@@ -134,7 +139,7 @@ func run() error {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("service_starting", "listen_addr", listenAddr, "ingest_endpoint", endpoint, "rate_per_second", ratePerSecond, "producer_id", producerID)
+	logger.Info("service_starting", "listen_addr", listenAddr, "ingest_endpoint", endpoint, "rate_per_second", ratePerSecond, "batch_size", batchSize, "producer_id", producerID)
 	select {
 	case <-ctx.Done():
 		return nil
