@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"time"
@@ -23,13 +24,14 @@ type Store struct {
 }
 
 const schemaLockID int64 = 2026041001
-const schemaVersion = "20260420_service_state_instances_v1"
+const schemaVersion = "20260423_tenant_metric_shards_v1"
 const schemaEnsureMaxAttempts = 3
 const schemaEnsureRetryDelay = 100 * time.Millisecond
 const serviceStateStaleAfter = 15 * time.Second
 const processedEventWriteMaxAttempts = 3
 const processedEventRetryDelay = 25 * time.Millisecond
 const processorAllowedLateness = 2 * time.Minute
+const tenantMetricShardCount = 32
 
 var eventWindowSizes = []time.Duration{time.Minute, 5 * time.Minute}
 
@@ -325,6 +327,7 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 		addAggregate(tenantAggregates, tenantMetricKey{
 			BucketStart: eventTime.Truncate(10 * time.Second),
 			TenantID:    input.Event.TenantID,
+			ShardID:     tenantMetricShardID(input.Event.TenantID, input.Event.SourceID),
 		}, aggregate)
 		addAggregate(sourceAggregates, sourceMetricKey{
 			TenantID: input.Event.TenantID,
@@ -347,10 +350,13 @@ func (s *Store) recordProcessedEventBatchOnce(ctx context.Context, inputs []Proc
 		tenantKeys = append(tenantKeys, key)
 	}
 	sort.Slice(tenantKeys, func(i, j int) bool {
-		if tenantKeys[i].BucketStart.Equal(tenantKeys[j].BucketStart) {
+		if !tenantKeys[i].BucketStart.Equal(tenantKeys[j].BucketStart) {
+			return tenantKeys[i].BucketStart.Before(tenantKeys[j].BucketStart)
+		}
+		if tenantKeys[i].TenantID != tenantKeys[j].TenantID {
 			return tenantKeys[i].TenantID < tenantKeys[j].TenantID
 		}
-		return tenantKeys[i].BucketStart.Before(tenantKeys[j].BucketStart)
+		return tenantKeys[i].ShardID < tenantKeys[j].ShardID
 	})
 	if err := upsertTenantMetricsBatch(ctx, tx, tenantKeys, tenantAggregates); err != nil {
 		return ProcessedEventBatchResult{}, err
@@ -425,6 +431,7 @@ func isRetryablePostgresError(err error) bool {
 type tenantMetricKey struct {
 	BucketStart time.Time
 	TenantID    string
+	ShardID     int32
 }
 
 type sourceMetricKey struct {
@@ -461,6 +468,14 @@ func addAggregate[K comparable](target map[K]metricAggregate, key K, value metri
 	target[key] = current
 }
 
+func tenantMetricShardID(tenantID string, sourceID string) int32 {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(tenantID))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(sourceID))
+	return int32(hash.Sum32() % tenantMetricShardCount)
+}
+
 func upsertTenantMetricsBatch(ctx context.Context, tx pgx.Tx, keys []tenantMetricKey, aggregates map[tenantMetricKey]metricAggregate) error {
 	if len(keys) == 0 {
 		return nil
@@ -468,6 +483,7 @@ func upsertTenantMetricsBatch(ctx context.Context, tx pgx.Tx, keys []tenantMetri
 
 	bucketStarts := make([]time.Time, 0, len(keys))
 	tenantIDs := make([]string, 0, len(keys))
+	shardIDs := make([]int32, 0, len(keys))
 	eventsCounts := make([]int64, 0, len(keys))
 	okCounts := make([]int64, 0, len(keys))
 	warnCounts := make([]int64, 0, len(keys))
@@ -478,6 +494,7 @@ func upsertTenantMetricsBatch(ctx context.Context, tx pgx.Tx, keys []tenantMetri
 		aggregate := aggregates[key]
 		bucketStarts = append(bucketStarts, key.BucketStart)
 		tenantIDs = append(tenantIDs, key.TenantID)
+		shardIDs = append(shardIDs, key.ShardID)
 		eventsCounts = append(eventsCounts, aggregate.EventsCount)
 		okCounts = append(okCounts, aggregate.OKCount)
 		warnCounts = append(warnCounts, aggregate.WarnCount)
@@ -488,24 +505,25 @@ func upsertTenantMetricsBatch(ctx context.Context, tx pgx.Tx, keys []tenantMetri
 
 	if _, err := tx.Exec(
 		ctx,
-		`INSERT INTO tenant_metrics (
-		     bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
+		`INSERT INTO tenant_metric_shards (
+		     bucket_start, tenant_id, shard_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
 		 )
-		 SELECT bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
+		 SELECT bucket_start, tenant_id, shard_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at
 		 FROM unnest(
-		     $1::timestamptz[], $2::text[], $3::bigint[], $4::bigint[],
-		     $5::bigint[], $6::bigint[], $7::double precision[], $8::timestamptz[]
-		 ) AS rows(bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at)
-		 ON CONFLICT (bucket_start, tenant_id)
+		     $1::timestamptz[], $2::text[], $3::integer[], $4::bigint[], $5::bigint[],
+		     $6::bigint[], $7::bigint[], $8::double precision[], $9::timestamptz[]
+		 ) AS rows(bucket_start, tenant_id, shard_id, events_count, ok_count, warn_count, error_count, value_sum, last_event_at)
+		 ON CONFLICT (bucket_start, tenant_id, shard_id)
 		 DO UPDATE SET
-		     events_count = tenant_metrics.events_count + EXCLUDED.events_count,
-		     ok_count = tenant_metrics.ok_count + EXCLUDED.ok_count,
-		     warn_count = tenant_metrics.warn_count + EXCLUDED.warn_count,
-		     error_count = tenant_metrics.error_count + EXCLUDED.error_count,
-		     value_sum = tenant_metrics.value_sum + EXCLUDED.value_sum,
-		     last_event_at = GREATEST(tenant_metrics.last_event_at, EXCLUDED.last_event_at)`,
+		     events_count = tenant_metric_shards.events_count + EXCLUDED.events_count,
+		     ok_count = tenant_metric_shards.ok_count + EXCLUDED.ok_count,
+		     warn_count = tenant_metric_shards.warn_count + EXCLUDED.warn_count,
+		     error_count = tenant_metric_shards.error_count + EXCLUDED.error_count,
+		     value_sum = tenant_metric_shards.value_sum + EXCLUDED.value_sum,
+		     last_event_at = GREATEST(tenant_metric_shards.last_event_at, EXCLUDED.last_event_at)`,
 		bucketStarts,
 		tenantIDs,
+		shardIDs,
 		eventsCounts,
 		okCounts,
 		warnCounts,
@@ -637,10 +655,17 @@ func (s *Store) GetOverview(ctx context.Context) (Overview, error) {
 		var errorLastMinute int64
 		if err := q.QueryRow(
 			ctx,
-			`SELECT
+			`WITH tenant_rollup AS (
+			     SELECT bucket_start, tenant_id, events_count, error_count
+			     FROM tenant_metrics
+			     UNION ALL
+			     SELECT bucket_start, tenant_id, events_count, error_count
+			     FROM tenant_metric_shards
+			 )
+			 SELECT
 			     COALESCE(SUM(events_count), 0),
 			     COALESCE(SUM(error_count), 0)
-			 FROM tenant_metrics
+			 FROM tenant_rollup
 			 WHERE bucket_start >= NOW() - INTERVAL '1 minute'`,
 		).Scan(&processedLastMinute, &errorLastMinute); err != nil {
 			return fmt.Errorf("query minute aggregates: %w", err)
@@ -818,10 +843,22 @@ func (s *Store) GetTenantSeries(ctx context.Context, tenantID string, window tim
 	err := s.withScopedQuerier(ctx, func(q dbQuerier) error {
 		rows, err := q.Query(
 			ctx,
-			`SELECT bucket_start, events_count, ok_count, warn_count, error_count,
-			        CASE WHEN events_count = 0 THEN 0 ELSE value_sum / events_count END AS average_value
-			 FROM tenant_metrics
+			`WITH tenant_rollup AS (
+			     SELECT bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum
+			     FROM tenant_metrics
+			     UNION ALL
+			     SELECT bucket_start, tenant_id, events_count, ok_count, warn_count, error_count, value_sum
+			     FROM tenant_metric_shards
+			 )
+			 SELECT bucket_start,
+			        COALESCE(SUM(events_count), 0),
+			        COALESCE(SUM(ok_count), 0),
+			        COALESCE(SUM(warn_count), 0),
+			        COALESCE(SUM(error_count), 0),
+			        CASE WHEN COALESCE(SUM(events_count), 0) = 0 THEN 0 ELSE COALESCE(SUM(value_sum), 0) / SUM(events_count) END AS average_value
+			 FROM tenant_rollup
 			 WHERE tenant_id = $1 AND bucket_start >= NOW() - $2::interval
+			 GROUP BY bucket_start
 			 ORDER BY bucket_start ASC`,
 			tenantID,
 			formatInterval(window),

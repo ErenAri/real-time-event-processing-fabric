@@ -125,15 +125,16 @@ The gate wrapper adds:
 | 2026-04-23 | 2000 | 60.53s | 898.67 | 910.44 | 69 | 182 | 0 | pre-batch evidence run with batcher disabled, artifact `artifacts/benchmarks/benchmark-performance-gate-20260423-124945.json`; target not met |
 | 2026-04-23 | 2000 | 60.83s | 1973.53 | 2030.64 | 125 | 345 | 0 | batch ingest endpoint, `4` producers, `3` processor replicas, batch size `25`, artifact `artifacts/benchmarks/benchmark-performance-gate-20260423-131819.json`; 2k gate met |
 | 2026-04-23 | 5000 | 60.24s | 4980.08 | 4962.23 | 27 | 67 | 163 | batch ingest endpoint, `4` producers, `3` processor replicas, batch size `25`, artifact `artifacts/benchmarks/benchmark-20260423-132558.json`; 5k gate narrowly not met |
+| 2026-04-23 | 5000 | 60.4s | 4971.03 | 5101.71 | 18 | 41 | 0 | sharded tenant aggregate table, `4` producers, `3` processor replicas, batch size `25`, artifact `artifacts/benchmarks/benchmark-20260423-175006.json`; 5k gate met |
 
 ## MVP gate status
 
 | Gate | Target | Current result | Status |
 | --- | --- | --- | --- |
-| Intermediate throughput | sustain `2,000 processed eps` locally | latest batch 5k run processed `4,962.23 eps` | Met |
-| MVP throughput | sustain `5,000 processed eps` locally | latest batch 5k run processed `4,962.23 eps` | Not met |
-| Query latency | dashboard/API p95 below `250 ms` | latest batch 5k run query p95 was `52.19 ms` | Met |
-| Post-load drain | lag returns to pre-run level within `30s` | latest batch 5k run drained in `3.59s` | Met |
+| Intermediate throughput | sustain `2,000 processed eps` locally | latest sharded 5k run processed `5,101.71 eps` | Met |
+| MVP throughput | sustain `5,000 processed eps` locally | latest sharded 5k run processed `5,101.71 eps` | Met once locally |
+| Query latency | dashboard/API p95 below `250 ms` | latest sharded 5k run query p95 was `54.91 ms` | Met |
+| Post-load drain | lag returns to pre-run level within `30s` | latest sharded 5k run drained in `2.05s` | Met |
 | Processor recovery | consumer restart recovers without data loss at sustainable rate | restart drill recovered lag in `6.29s` at `300 eps` with `3` processor replicas | Met at controlled rate |
 | Broker failure accounting | publish failures visible and archive accounting closed | broker outage had archive accounting gap `0` and accepted traffic recovered in `2.09s` | Met |
 | Replay/idempotency | replay does not overcount hot views | `25` duplicate replays produced `0` source-metric overcount; rebuild restored hot views | Met |
@@ -165,10 +166,10 @@ The committed example is `docs/evidence.example.json`. Runtime artifacts remain 
 
 ## Interpretation
 
-- The processor hot path uses bounded per-partition batches and set-based aggregate upserts, and the batch ingest profile now meets the 2k processed-eps gate. Do not present the `4,962.23 processed eps` result as a 5k pass because it is still below the gate.
+- The processor hot path uses bounded per-partition batches, batch ingest, and sharded tenant aggregate upserts. The latest local run meets both the 2k and 5k processed-eps gates once.
 - Multi-producer generation prevents a single simulator process from being the only limiter, and `SIM_PRODUCER_ID` prevents synthetic `event_id` collisions across producers.
 - The latest batch 2k gate accepted `1,973.53 eps` from an offered `2,000 eps` and processed `2,030.64 eps`. The older one-event HTTP profile accepted only `898.67 eps`, which shows why the batch ingest path is the current credible producer model.
-- The latest batch 5k benchmark accepted `4,980.08 eps` and processed `4,962.23 eps`. Query latency and drain time pass, but tenant aggregate writes become visibly slower at higher load.
+- The latest sharded 5k benchmark accepted `4,971.03 eps` and processed `5,101.71 eps`. Query latency and drain time pass, but repeatability still needs multiple clean-state runs.
 - Backpressure rejections are now metric-only instead of being written to PostgreSQL rejection rows, which avoids amplifying database load during overload.
 - Poison-message handling is verified separately in `artifacts/failure-drills/inject-poison-message-20260417-193308.json` so malformed direct-to-Kafka records can be tested without distorting the hot benchmark stream.
 - Processor scale-out exposed a startup DDL deadlock in schema initialization. The fix adds a schema migration marker plus retry around PostgreSQL deadlock and serialization errors so additional processor replicas do not repeatedly run the full DDL block.
@@ -176,7 +177,7 @@ The committed example is `docs/evidence.example.json`. Runtime artifacts remain 
 
 ## Current bottleneck
 
-The next performance limitation is no longer the one-event HTTP ingest path at 2k. The latest batch evidence shows the 2k gate passing and the 5k gate narrowly failing, with PostgreSQL tenant aggregate writes as the clearest high-load bottleneck.
+The next performance limitation is no longer the one-event HTTP ingest path or the unsharded tenant aggregate row. The latest sharded batch evidence shows the 5k gate passing once locally. The next measurable risk is repeatability under clean-state reruns and post-change failure behavior.
 
 Measured slow stages before the 2026-04-23 fixes from `artifacts/benchmarks/benchmark-performance-gate-20260420-160655.json`:
 
@@ -220,13 +221,21 @@ Measured slow stages from the latest 5k batch run, `artifacts/benchmarks/benchma
 - Processor window aggregate upsert: `p95 35.5 ms`
 - Processor dedup claim: `p95 26.94 ms`
 
-The benchmark evidence is useful because it shows that batch ingest closes the immediate 2k gap and nearly reaches 5k, but it should not be presented as a 5k eps success.
+Measured slow stages from the latest sharded 5k run, `artifacts/benchmarks/benchmark-20260423-175006.json`:
+
+- Ingest validation: `p95 4.89 ms`
+- Ingest archive step: `p95 4.78 ms`
+- Ingest Kafka publish: `p95 113.31 ms`
+- Processor tenant aggregate upsert: `p95 141.7 ms`
+- Processor window aggregate upsert: `p95 38.54 ms`
+- Processor dedup claim: `p95 42.67 ms`
+
+The benchmark evidence is useful because it shows that sharding tenant aggregates reduced the 5k tenant aggregate p95 from `558.48 ms` to `141.7 ms` and moved processed throughput from `4,962.23 eps` to `5,101.71 eps`.
 
 The next defensible benchmark step is one of:
 
-- repeat the `5,000 eps` batch profile on clean state to establish variance
-- reduce the tenant aggregate p95 spike visible in the latest 5k run
-- reduce tenant aggregate write amplification further, likely with partitioned hot tables, staging-table merge, or lower-cardinality rollups
+- repeat the `5,000 eps` sharded batch profile on clean state to establish variance
+- rerun restart, broker-outage, Postgres-pause, replay, and poison-message drills against the new batch/sharded hot path
+- profile Kafka publish p99 and dedup claim p99 under the passing 5k profile
 - profile processor PostgreSQL write latency and batch behavior under sustained backlog
-- rerun the failure drills against the batch profile before making a stronger resilience claim
 - run the same profile on stronger local hardware or a cloud deployment where producer, broker, and database capacity can be scaled independently
